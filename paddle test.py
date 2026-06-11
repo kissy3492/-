@@ -73,7 +73,15 @@ def main() -> int:
 
     print("PaddleOCR を初期化中（初回はモデル自動ダウンロード）...")
     from paddleocr import PaddleOCR
-    ocr = PaddleOCR(lang="japan")
+    # 補助モデル（文書向き判定・歪み補正・行向き判定）は無効化。
+    # 理由: プロキシ環境でのモデル取得失敗を避ける＋平置きスキャンには不要。
+    # 90度回転PDF等の向き補正は本体ツール側でOpenCVにより実装予定。
+    ocr = PaddleOCR(
+        lang="japan",
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+    )
 
     all_rows = []
     for img in images:

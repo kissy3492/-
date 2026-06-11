@@ -1,0 +1,2158 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Oculus — 銀行帳票OCR検証ツール (Phase 1)</title>
+
+<!--
+  ============================================================================
+  Oculus — 銀行取引明細OCR検証ツール  (Phase 1 / v0.10)
+  ----------------------------------------------------------------------------
+  v0.10 の主な変更:
+   [速度] 二段OCR: まず高速設定で全セルを読み、検算不一致・低信頼・日付異常の行だけ
+          精密設定＋PDF高解像度再描画で再OCR（両パスの候補を統合して修復精度も向上）
+   [速度] 空白セル事前判定: インク量で空欄を即判定しOCR省略（出金/入金の空欄は毎行発生）
+   [精度] 日付の単調性チェック（時系列逆行を「日付逆行?」として検出）
+   [他]   並列ワーカー上限を8へ / 再OCRセルに「再OCR」バッジ表示
+  v0.9 の主な変更:
+   [AI]   ローカルAI(PaddleOCR/ONNX Runtime Web)による摘要・その他列の認識（任意導入）
+          lib/ort.min.js + lib/ppocr/rec_japan.onnx + japan_dict.txt 設置で自動有効化。
+          未設置・失敗時はTesseractへ自動フォールバック。外部通信は一切なし。
+          低信頼時はTesseract結果と比較して良い方を採用。AIで読んだセルは「AI」バッジ表示。
+  v0.8 の主な変更:
+   [精度] 摘要辞書補正（登録語との曖昧一致・NFKC正規化で半角カナ対応・結果から学習）
+   [操作] ルーペ倍率スライダー（2〜6×）
+   [修正] 縦横混在PDFで四隅が換算されないバグ / 中断が即時に効かない問題
+   [修正] ワーカー数変更時の旧プール未解放（メモリリーク）
+  v0.7 の主な変更:
+   [精度] 罫線自動検出→格子吸着（行境界を実罫線に合わせる。失敗時は均等分割）
+   [精度] ヘッダ行除外オプション / 日付列を jpn+eng で読取＋日付妥当性チェック
+   [精度] 検算修復の強化（空欄仮説の注入＝両建て誤読の自動修復、
+          複数候補一致時はスコアリングで選択、修復セルの信頼度は底上げしない）
+   [速度] Tesseractワーカープールによる並列OCR（既定2・設定可）＋進捗バー＋中断
+   [実務] PDF複数ページ一括OCR（同一四隅を適用・残高連鎖をページ跨ぎで検算）
+   [実務] 結果セルのクリック編集（検算は即時再計算）/ 要確認セルの切出画像表示
+   [規約] innerHTML 全廃（DOM API化）/ テンプレ読込のtool識別子検証
+   [堅牢] Mat解放のfinally化 / clearBorderのセル寸法比例化 / 画像倍率上限の明示化
+  ============================================================================
+  ★これは「外部通信ゼロで使う」ローカル同梱版です。
+    lib/ 配下に必要ライブラリを配置してローカルサーバから開きます。
+
+  ・帳票データはブラウザ内（WebAssembly）で処理され、外部に送信されません。
+  ・外部に出る通信はありません。
+  ・ただし、初回のライブラリ取得スクリプト実行時だけ各公式配布元へ接続します。
+  ・取得後は、実データでも通信ゼロのローカル実行が前提です。
+
+  【同梱ファイルの取得元（取得スクリプト実行時のみ外部接続）】
+    OpenCV.js    : docs.opencv.org
+    PDF.js       : cdnjs
+    Tesseract.js : jsDelivr / npm package
+    言語データ    : Tesseract.js 用 tessdata
+    ONNX Runtime : npm package
+    PaddleOCR    : PaddleOCR 公式配布モデル・辞書
+  実データを読む通常利用時は、これらを ./lib/ に置いたローカル読込だけを行います。
+  ============================================================================
+-->
+
+<style>
+  :root{
+    /* palette: navy / gold / parchment */
+    --navy:#16223d; --navy-2:#1f2f52; --navy-3:#2a3d68;
+    --gold:#c4a04a; --gold-soft:#e0c47e;
+    --parch:#f4ecd6; --parch-2:#ebe0c2;
+    --ink:#1a1c22; --muted:#6b6f7a;
+    --ok:#3f7d4e; --warn:#b8862b; --bad:#b3402f;
+    --line:#d7cba6;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    font-family:-apple-system,"Segoe UI","Hiragino Kaku Gothic ProN","Meiryo",sans-serif;
+    background:var(--parch); color:var(--ink); font-size:14px; line-height:1.55;
+  }
+  header{
+    background:linear-gradient(180deg,var(--navy) 0%, var(--navy-2) 100%);
+    color:var(--parch); padding:16px 22px; border-bottom:3px solid var(--gold);
+  }
+  header h1{
+    margin:0; font-family:Georgia,"Times New Roman",serif; font-weight:600;
+    font-size:22px; letter-spacing:.5px;
+  }
+  header h1 .mark{color:var(--gold-soft);}
+  header .sub{margin-top:2px; font-size:12px; color:#c8d0e2; letter-spacing:.4px;}
+
+  #libStatus{padding:8px 22px; font-size:12.5px; border-bottom:1px solid var(--line);}
+  #libStatus.loading{background:#fff7e0; color:#7a5a10;}
+  #libStatus.ready{background:#e8f3ea; color:#2c5c3a;}
+  #libStatus.error{background:#f7e6e2; color:#8a2f22;}
+
+  .wrap{display:grid; grid-template-columns: 360px 1fr; gap:0; min-height:calc(100vh - 120px);}
+  .panel{padding:18px 20px; border-right:1px solid var(--line); background:var(--parch-2);}
+  .stage{padding:18px 20px; overflow:auto;}
+
+  .step{border:1px solid var(--line); background:var(--parch); border-radius:6px; margin-bottom:14px;}
+  .step > .hd{
+    display:flex; align-items:center; gap:8px; padding:10px 12px;
+    background:var(--navy-3); color:var(--parch); border-radius:6px 6px 0 0;
+    font-family:Georgia,serif; font-size:14px;
+  }
+  .step > .hd .n{
+    display:inline-flex; align-items:center; justify-content:center;
+    width:22px;height:22px;border-radius:50%; background:var(--gold); color:var(--navy);
+    font-weight:700; font-size:12px;
+  }
+  .step > .bd{padding:12px;}
+
+  label{display:block; font-size:12px; color:var(--muted); margin:8px 0 3px;}
+  input[type=number], input[type=text], select{
+    width:100%; padding:6px 8px; border:1px solid var(--line); border-radius:4px;
+    background:#fff; font-size:13px;
+  }
+  .row{display:flex; gap:8px;}
+  .row > *{flex:1;}
+
+  button{
+    font-family:inherit; cursor:pointer; border:none; border-radius:4px;
+    padding:8px 12px; font-size:13px; font-weight:600;
+  }
+  button.primary{background:var(--navy); color:var(--parch);}
+  button.primary:hover{background:var(--navy-2);}
+  button.gold{background:var(--gold); color:var(--navy);}
+  button.gold:hover{background:var(--gold-soft);}
+  button.ghost{background:transparent; color:var(--navy); border:1px solid var(--navy);}
+  button:disabled{opacity:.4; cursor:not-allowed;}
+  .btnrow{display:flex; gap:8px; margin-top:10px; flex-wrap:wrap;}
+
+  .hint{font-size:11.5px; color:var(--muted); margin-top:6px;}
+
+  /* canvas stage */
+  .canvas-host{position:relative; display:inline-block; border:1px solid var(--line); background:#fff;}
+  #overlay{position:absolute; left:0; top:0; cursor:crosshair; touch-action:none;}
+  #loupe{position:absolute; display:none; border:2px solid var(--navy); border-radius:50%;
+         box-shadow:0 2px 10px rgba(0,0,0,.4); pointer-events:none; background:#fff; z-index:20;}
+  .corner-tags{font-size:11px; color:var(--navy); margin:6px 0;}
+
+  table.results{border-collapse:collapse; width:100%; font-size:12.5px; background:#fff;}
+  table.results th, table.results td{border:1px solid var(--line); padding:4px 6px; text-align:left;}
+  table.results th{background:var(--navy-3); color:var(--parch); position:sticky; top:0;}
+  td.amt{font-family:"SFMono-Regular",Consolas,monospace; text-align:right;}
+  tr.flag td{background:#fbe9e4;}
+  .conf{font-size:10.5px; color:var(--muted);}
+  .conf.low{color:var(--bad); font-weight:700;}
+
+  .badge{display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px; font-weight:700;}
+  .badge.ok{background:#dff0e3; color:var(--ok);}
+  .badge.bad{background:#f7ddd6; color:var(--bad);}
+  .badge.warn{background:#fbe6c8; color:#8a5a12;}
+  .badge.info{background:#e1ecf7; color:#1f4f7a;}
+  .ocrraw{display:block; color:#8a5a12; font-size:10px; margin-top:1px;}
+
+  #log{
+    font-family:"SFMono-Regular",Consolas,monospace; font-size:11px; color:#3a4256;
+    background:#fbf6e6; border:1px solid var(--line); border-radius:4px;
+    padding:8px; height:120px; overflow:auto; white-space:pre-wrap; margin-top:8px;
+  }
+  .colmap{display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:6px;}
+  .empty-stage{color:var(--muted); font-style:italic; padding:40px;}
+  details{margin-top:6px;} summary{cursor:pointer; font-size:12px; color:var(--navy);}
+
+  .progress{height:10px; background:#e7dcbb; border:1px solid var(--line); border-radius:5px; overflow:hidden;}
+  .progress i{display:block; height:100%; width:0; background:linear-gradient(90deg,var(--gold),var(--gold-soft)); transition:width .2s;}
+  img.thumb{display:block; max-width:170px; max-height:36px; border:1px solid var(--line); background:#fff; margin-top:2px;}
+  .celltext{cursor:pointer; border-bottom:1px dotted #b9ab86;}
+  .celltext:hover{background:#f3e9cd;}
+  input.celledit{width:100%; min-width:60px; font-size:12px; padding:2px 4px; border:1px solid var(--gold); border-radius:3px;}
+
+
+  /* 非ネイティブ確認ダイアログ（大量ページ実行前など） */
+  .modal-backdrop{
+    position:fixed; inset:0; z-index:1000; background:rgba(10,16,30,.48);
+    display:flex; align-items:center; justify-content:center; padding:24px;
+  }
+  .modal-card{
+    width:min(560px,100%); background:var(--parch); color:var(--ink);
+    border:2px solid var(--gold); border-radius:8px; box-shadow:0 16px 48px rgba(0,0,0,.35);
+  }
+  .modal-card .modal-hd{padding:12px 14px; background:var(--navy-3); color:var(--parch); font-weight:700;}
+  .modal-card .modal-bd{padding:14px; white-space:pre-wrap;}
+  .modal-card .modal-ft{padding:12px 14px; display:flex; gap:8px; justify-content:flex-end; border-top:1px solid var(--line);}
+
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Oculus <span class="mark">·</span> 銀行帳票OCR検証ツール</h1>
+  <div class="sub">Phase 1 / v0.10 ・ ローカル同梱版（外部通信ゼロ）・格子吸着/並列OCR/複数ページ/セル編集</div>
+</header>
+
+<div id="libStatus" class="loading">ライブラリ読み込み状態を確認中…</div>
+
+<div class="wrap">
+  <!-- ===== 左：操作パネル ===== -->
+  <div class="panel">
+
+    <div class="step">
+      <div class="hd"><span class="n">1</span> 帳票を読み込む</div>
+      <div class="bd">
+        <label>PDF または 画像（PNG/JPG）</label>
+        <input type="file" id="fileInput" accept="application/pdf,image/png,image/jpeg">
+        <div class="row" style="margin-top:8px;">
+          <div>
+            <label>ページ番号（PDF時）</label>
+            <input type="number" id="pageNum" value="1" min="1">
+          </div>
+          <div>
+            <label>描画倍率（高いほど高精度・重い）</label>
+            <input type="number" id="renderScale" value="2.5" min="1" max="5" step="0.5">
+          </div>
+        </div>
+        <div class="btnrow">
+          <button class="primary" id="loadBtn" disabled>ページを表示</button>
+        </div>
+        <div class="hint">スキャンは300dpi以上推奨。倍率2.5前後が目安です。</div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="hd"><span class="n">2</span> 表の四隅を指定（幾何補正）</div>
+      <div class="bd">
+        <div class="hint">表（罫線の外枠）の四隅を
+          <b>左上 → 右上 → 右下 → 左下</b> の順にクリック。傾き・歪みを補正します。
+          指定後は<b>点をドラッグ</b>して微調整できます（ルーペ表示で精密に合わせられます）。</div>
+        <div class="corner-tags" id="cornerTags">未指定（0/4）</div>
+        <label style="margin-top:6px;"><input type="checkbox" id="optLoupe" checked> 配置・ドラッグ中にルーペ（拡大鏡）を表示</label>
+        <div class="row" style="margin-top:4px;">
+          <div>
+            <label>ルーペ倍率 <span id="loupeZoomVal">3.5</span>×</label>
+            <input type="range" id="loupeZoom" min="2" max="6" step="0.5" value="3.5">
+          </div>
+        </div>
+        <div class="btnrow">
+          <button class="ghost" id="resetCornersBtn">四隅をやり直す</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="hd"><span class="n">3</span> 格子と列の定義</div>
+      <div class="bd">
+        <div class="row">
+          <div><label>行数（固定）</label><input type="number" id="rows" value="20" min="1"></div>
+          <div><label>列数</label><input type="number" id="cols" value="4" min="1"></div>
+        </div>
+        <label>各列の役割（検算に使用）</label>
+        <div class="colmap" id="colMap"></div>
+        <div class="hint">「日付/摘要/出金/入金/残高」などを各列に割当て。
+          出金・入金・残高を指定すると残高連鎖の自動検算が有効になります。</div>
+        <details>
+          <summary>列幅の比率（任意・カンマ区切り）</summary>
+          <input type="text" id="colWidths" placeholder="例: 1,3,1.2,1.2,1.4（空欄なら均等）" style="margin-top:6px;">
+        </details>
+        <div class="row" style="margin-top:8px;">
+          <div><label>ヘッダ行数（OCRから除外）</label><input type="number" id="headerRows" value="1" min="0" max="10"></div>
+        </div>
+        <label style="margin-top:6px;"><input type="checkbox" id="optSnapGrid" checked> 罫線を自動検出して格子を吸着（行数は検出結果で自動上書き）</label>
+        <div class="hint">吸着ON時は補正後画像から罫線位置を検出し、行の境界を実罫線に合わせます。列は検出数が設定列数と一致した場合のみ吸着し、それ以外は比率分割のまま。検出失敗時は均等分割に戻ります。</div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="hd"><span class="n">⚙</span> 詳細設定（精度調整）</div>
+      <div class="bd">
+        <div class="row">
+          <div>
+            <label>2値化方式</label>
+            <select id="binMethod"><option value="otsu">大津(既定)</option><option value="adaptive">適応</option><option value="none">なし</option></select>
+          </div>
+          <div>
+            <label>読取DPI</label>
+            <input type="number" id="ocrDpi" value="300" min="70" max="600">
+          </div>
+        </div>
+        <div class="row" style="margin-top:6px;">
+          <div><label>セル内余白(%)</label><input type="number" id="padPct" value="6" min="0" max="25"></div>
+          <div><label>低信頼しきい値</label><input type="number" id="confTh" value="60" min="0" max="100"></div>
+        </div>
+        <label style="margin-top:8px;"><input type="checkbox" id="optLineRemove" checked> 罫線を除去してから読む</label>
+        <label><input type="checkbox" id="optDenoise" checked> 軽いノイズ除去</label>
+        <label><input type="checkbox" id="optNumEng" checked> 出金/入金/残高列は英語モデルで読む（数字精度↑）</label>
+        <label><input type="checkbox" id="optPaddle" checked> 摘要・その他列はローカルAI(PaddleOCR)で読む <span id="ppStatus" class="badge info" style="display:none;"></span></label>
+        <div class="hint">lib/ort.min.js と lib/ppocr/（認識モデル＋辞書）設置時のみ有効。未設置なら自動的にTesseractで読みます。導入手順は同梱の「AI導入手順」参照。</div>
+        <label><input type="checkbox" id="optTwoStage" checked> 二段OCR（まず高速に読み、検算が合わない行だけ精密＋高解像度で再OCR）</label>
+        <label><input type="checkbox" id="optBlankSkip" checked> 空白セルを事前判定してOCR省略（速度↑・空欄の誤読↓）</label>
+        <label><input type="checkbox" id="optRetry" checked> 低信頼セルは方式を変えて再挑戦（精度優先・やや遅い）</label>
+        <label><input type="checkbox" id="optMultiPass" checked> 数値・日付列は複数の前処理で読み比べる（さらに遅いが精度優先）</label>
+        <label><input type="checkbox" id="optNormalize" checked> 数値・日付列の典型的なOCR誤変換を補正する</label>
+        <label style="margin-top:8px;">並列ワーカー数（1〜8・OCR速度。目安はCPUコア数の半分）</label>
+        <input type="number" id="workerN" value="2" min="1" max="8">
+        <div class="hint">次回OCR実行時に反映されます（変更時は旧プールを解放して再構築）。メモリの少ないPCでは1を推奨。</div>
+        <details style="margin-top:10px;">
+          <summary>摘要辞書による補正（精度↑・推奨）</summary>
+          <div class="hint">よく出る摘要（取引種別・振込先名など）を1行1語で登録。OCR結果が辞書の語に近い場合、辞書の語へ自動補正します。銀行明細は同じ摘要が何度も繰り返されるため、この方式は実務上よく効きます。半角カナ・全角の表記ゆれは自動で吸収します。テンプレート保存に含まれます。</div>
+          <textarea id="descDict" placeholder="例:&#10;給与振込&#10;口座振替&#10;ATM&#10;ｶ)ﾄﾖﾀ自動車" style="width:100%; height:100px; font-size:12px; font-family:'SFMono-Regular',Consolas,monospace; border:1px solid var(--line); border-radius:4px;"></textarea>
+          <div class="btnrow">
+            <button class="ghost" id="dictLearnBtn">今回の結果から学習（高信頼・手修正の摘要を追加）</button>
+          </div>
+        </details>
+        <div class="hint">実機で1ページ通したら、ここを動かしながら格子線の合い具合と結果を見て追い込めます。</div>
+        <div class="btnrow" style="margin-top:10px;">
+          <button class="ghost" id="tplSaveBtn">設定を保存</button>
+          <button class="ghost" id="tplLoadBtn">設定を読込</button>
+          <button class="ghost" id="tplLoadLastBtn">直近設定を復元</button>
+          <input type="file" id="tplFile" accept="application/json" style="display:none;">
+        </div>
+        <div class="hint">銀行・帳票ごとに設定（行数/列/列幅/余白/2値化/罫線除去等）をJSONで保存・再利用できます。</div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="hd"><span class="n">4</span> OCR実行・検算</div>
+      <div class="bd">
+        <label>OCR対象ページ（PDF時・例: 1-3,5 ／ 空欄=表示中のページのみ）</label>
+        <input type="text" id="pageRange" placeholder="空欄なら表示中のページのみ">
+        <div class="hint">複数ページは同じ四隅・同じ格子設定を適用し、残高連鎖もページをまたいで検算します。</div>
+        <div class="btnrow">
+          <button class="gold" id="runBtn" disabled>このページをOCR</button>
+          <button class="ghost" id="abortBtn" disabled>中断</button>
+          <button class="ghost" id="exportBtn" disabled>Excelへコピー（タブ区切り）</button>
+        </div>
+        <div id="progWrap" style="display:none; margin-top:8px;">
+          <div id="progText" class="hint"></div>
+          <div class="progress"><i id="progBar"></i></div>
+        </div>
+        <label style="margin-top:8px;"><input type="checkbox" id="optShowThumbs" checked> 要確認セルの切出画像を結果に表示</label>
+        <label style="margin-top:10px;">処理ログ</label>
+        <div id="log"></div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ===== 右：ステージ ===== -->
+  <div class="stage">
+    <div id="stageEmpty" class="empty-stage">
+      左の「1」から帳票を読み込んでください。<br>
+      読み込むと、ここに画像が表示され、四隅をクリックできます。
+    </div>
+
+    <div id="canvasArea" style="display:none;">
+      <div class="canvas-host">
+        <canvas id="baseCanvas"></canvas>
+        <canvas id="overlay"></canvas>
+        <canvas id="loupe" width="160" height="160"></canvas>
+      </div>
+    </div>
+
+    <div id="warpedArea" style="display:none; margin-top:16px;">
+      <h3 style="font-family:Georgia,serif; color:var(--navy); margin:0 0 6px;">補正後（格子オーバーレイ）</h3>
+      <canvas id="warpedCanvas" style="border:1px solid var(--line); max-width:100%;"></canvas>
+    </div>
+
+    <div id="resultArea" style="display:none; margin-top:18px;">
+      <h3 style="font-family:Georgia,serif; color:var(--navy); margin:0 0 6px;">
+        認識結果・検算 <span id="resultBadge"></span>
+      </h3>
+      <div class="btnrow" style="margin-bottom:6px;">
+        <label style="margin:0;"><input type="checkbox" id="optFlaggedOnly"> 要確認の行だけ表示</label>
+        <span id="resultInfo" class="hint" style="margin-left:8px;"></span>
+      </div>
+      <div style="max-height:480px; overflow:auto; border:1px solid var(--line);">
+        <table class="results" id="resultTable"></table>
+      </div>
+      <div class="hint">背景が赤い行＝検算不一致または低信頼度。セルの文字をクリックすると修正でき、修正すると検算を即時再計算します。</div>
+      <textarea id="tsvOut" readonly style="display:none; width:100%; height:90px; margin-top:8px; font-family:'SFMono-Regular',Consolas,monospace; font-size:11px; border:1px solid var(--line); border-radius:4px;"></textarea>
+    </div>
+  </div>
+</div>
+
+<!-- ============ ライブラリ（ローカル取得・外部通信なし） ============ -->
+<script src="./lib/opencv.js" onerror="window.__noCV=true"></script>
+<script src="./lib/pdf.min.js" onerror="window.__noPDF=true"></script>
+<script src="./lib/tesseract.min.js" onerror="window.__noTess=true"></script>
+<script src="./lib/ort.min.js" onerror="window.__noORT=true"></script><!-- 任意: ローカルAI(PaddleOCR)用。未設置でも本体は動作 -->
+
+<script>
+/* =========================================================================
+   状態とユーティリティ
+   ========================================================================= */
+const S = {
+  cvReady:false, pdfReady:false, tessReady:false,
+  img:null,                 // 元画像（ImageBitmap or canvas由来）
+  baseW:0, baseH:0,         // 表示canvasの実ピクセル
+  corners:[],               // [{x,y}] 左上→右上→右下→左下
+  srcKind:null,             // 'pdf' | 'img'
+  pdfDoc:null,              // PDF.js のドキュメント（複数ページ一括用）
+  abort:false,              // OCR中断フラグ
+  lastRows:null,            // OCR結果 [[{text,conf},...],...]（row.__page にページ番号）
+  lastAnalysis:null          // 検算・推定結果 [{verdict, className}]
+};
+
+const $ = id => document.getElementById(id);
+function log(msg){
+  const el=$('log'); const t=new Date().toLocaleTimeString();
+  el.textContent += `[${t}] ${msg}\n`; el.scrollTop=el.scrollHeight;
+}
+// DOM構築ヘルパー（innerHTML不使用の規約準拠）
+function el(tag, attrs, ...kids){
+  const e=document.createElement(tag);
+  if(attrs) for(const k in attrs){
+    if(k==='class') e.className=attrs[k];
+    else if(k==='text') e.textContent=attrs[k];
+    else e.setAttribute(k, attrs[k]);
+  }
+  kids.forEach(k=>{ if(k==null) return; e.appendChild(typeof k==='string'?document.createTextNode(k):k); });
+  return e;
+}
+function clearEl(e){ while(e.firstChild) e.removeChild(e.firstChild); }
+function badge(cls, text){ return el('span',{class:'badge '+cls, text}); }
+
+
+function showConfirmDialog(message, opts){
+  opts=opts||{};
+  return new Promise(resolve=>{
+    const back=el('div',{class:'modal-backdrop'});
+    const card=el('div',{class:'modal-card'});
+    const title=el('div',{class:'modal-hd', text:opts.title||'確認'});
+    const body=el('div',{class:'modal-bd', text:message});
+    const foot=el('div',{class:'modal-ft'});
+    const cancel=el('button',{class:'ghost', type:'button', text:opts.cancelText||'中止'});
+    const ok=el('button',{class:'gold', type:'button', text:opts.okText||'実行'});
+    const close=v=>{ try{ document.body.removeChild(back); }catch(e){} resolve(v); };
+    cancel.addEventListener('click',()=>close(false));
+    ok.addEventListener('click',()=>close(true));
+    back.addEventListener('click',e=>{ if(e.target===back) close(false); });
+    document.addEventListener('keydown', function onKey(e){
+      if(!document.body.contains(back)){ document.removeEventListener('keydown',onKey); return; }
+      if(e.key==='Escape'){ document.removeEventListener('keydown',onKey); close(false); }
+    });
+    foot.append(cancel,ok); card.append(title,body,foot); back.appendChild(card); document.body.appendChild(back); ok.focus();
+  });
+}
+
+function validateRunSettings(){
+  const roles=rolesByIndex();
+  const effective=roles.filter(r=>r && r!=='(無視)');
+  if(!effective.length){ log('実行不可: OCR対象列がありません。列の役割を少なくとも1つ指定してください。'); return false; }
+  const uniqueRequired=['日付','出金','入金','残高'];
+  for(const r of uniqueRequired){
+    const count=roles.filter(x=>x===r).length;
+    if(count>1){ log('実行不可: 「'+r+'」列が複数あります。検算が壊れるため1列にしてください。'); return false; }
+  }
+  if(roles.includes('出金') || roles.includes('入金')){
+    if(!roles.includes('残高')) log('注意: 出金/入金はありますが残高列がないため、残高連鎖の検算はできません。');
+  }
+  return true;
+}
+
+function ensureCell(row, idx){
+  if(idx==null || idx<0) return {text:'',conf:0};
+  if(!row[idx]) row[idx]={text:'', rawText:'', conf:0, error:true};
+  return row[idx];
+}
+function normalizeResultRows(rows, colN){
+  rows.forEach(row=>{
+    for(let i=0;i<colN;i++) ensureCell(row,i);
+  });
+  return rows;
+}
+
+/* =========================================================================
+   ライブラリ読み込み確認
+   ========================================================================= */
+function setLibStatus(){
+  const box=$('libStatus');
+  const missing=[];
+  if(window.__noCV || typeof cv==='undefined') missing.push('opencv.js');
+  if(window.__noPDF || typeof pdfjsLib==='undefined') missing.push('pdf.min.js');
+  if(window.__noTess || typeof Tesseract==='undefined') missing.push('tesseract.min.js');
+
+  if(missing.length){
+    box.className='error';
+    clearEl(box);
+    box.appendChild(document.createTextNode('⚠ 読み込めなかったライブラリ: '));
+    box.appendChild(el('b',{text:missing.join(', ')}));
+    box.appendChild(document.createTextNode(' ／ lib/ 配下に必要ファイルが揃っているか確認してください。'));
+    return false;
+  }
+  return true;
+}
+
+// OpenCVは初期化に時間差があるため onRuntimeInitialized を待つ
+function waitForCV(timeoutMs=12000){
+  return new Promise(res=>{
+    let settled=false;
+    const finish=ok=>{
+      if(settled) return;
+      settled=true;
+      S.cvReady=!!ok;
+      res(!!ok);
+    };
+    if(typeof cv==='undefined') return finish(false);
+    if(cv && cv.Mat) return finish(true);
+    // 新形式(OpenCV.js 4.9以降の公式ビルド): cv はモジュールを返すPromise
+    if(typeof cv.then==='function'){
+      cv.then(m=>{ if(m) window.cv=m; finish(typeof window.cv!=='undefined' && !!window.cv.Mat); })
+        .catch(()=>finish(false));
+      setTimeout(()=>finish(false), timeoutMs);
+      return;
+    }
+    // 旧形式: onRuntimeInitialized を待つ（read-onlyな実装もあるためポーリング併用）
+    try{
+      const prev=cv['onRuntimeInitialized'];
+      cv['onRuntimeInitialized']=()=>{
+        try{ if(typeof prev==='function') prev(); }catch(e){}
+        finish(true);
+      };
+    }catch(e){}
+    const iv=setInterval(()=>{
+      if(typeof cv!=='undefined' && cv && cv.Mat){ clearInterval(iv); finish(true); }
+    }, 200);
+    setTimeout(()=>{ clearInterval(iv); finish(false); }, timeoutMs);
+  });
+}
+
+window.addEventListener('load', async ()=>{
+  if(!setLibStatus()) return;
+
+  // file:// で直接開くとOCRエンジンが読めない（ブラウザのセキュリティ制限）
+  if(location.protocol==='file:'){
+    const box=$('libStatus');
+    box.className='error';
+    box.textContent='⚠ file:// で開いています。OCRエンジン(Tesseract)はローカルサーバ(http://127.0.0.1)経由でないと動きません。起動スクリプト等でサーバ経由で開いてください。';
+    log('⚠ file:// で開いています。ローカルサーバ経由で開いてください。');
+    return;
+  }
+
+  // PDF.js worker
+  try{ pdfjsLib.GlobalWorkerOptions.workerSrc='./lib/pdf.worker.min.js'; S.pdfReady=true; }
+  catch(e){ log('PDF.js worker設定失敗: '+e.message); }
+
+  // Tesseract（後段でworker生成。存在確認のみ）
+  S.tessReady = (typeof Tesseract!=='undefined');
+
+  $('libStatus').className='loading';
+  $('libStatus').textContent='OpenCV を初期化中…';
+  const cvOk = await waitForCV();
+  if(!cvOk) log('OpenCVの初期化が完了しませんでした。opencv.jsの配置・破損・ブラウザ互換性を確認してください。');
+
+  const ok = S.cvReady && S.pdfReady && S.tessReady;
+  $('libStatus').className = ok?'ready':'error';
+  $('libStatus').textContent = ok
+    ? '✓ 準備完了。帳票データはブラウザ内で処理され外部送信されません（ライブラリもローカル読込）。'
+    : '⚠ 一部ライブラリを読み込めませんでした。./lib/ の配置、ファイル名、ローカルサーバ経由の起動を確認してください。';
+  $('loadBtn').disabled = !ok;
+  log('初期化完了: cv='+S.cvReady+' pdf='+S.pdfReady+' tess='+S.tessReady);
+});
+
+/* =========================================================================
+   列マッピングUIの生成
+   ========================================================================= */
+const ROLE_OPTIONS = ['(無視)','日付','摘要','出金','入金','残高','その他'];
+function buildColMap(){
+  const n=parseInt($('cols').value)||0;
+  const host=$('colMap'); clearEl(host);
+  // 列数別の素直な既定割当（5列=日付/摘要/出金/入金/残高、4列=日付/摘要/出金/残高）
+  const presets={
+    3:['日付','摘要','残高'],
+    4:['日付','摘要','出金','残高'],
+    5:['日付','摘要','出金','入金','残高'],
+    6:['日付','摘要','出金','入金','残高','その他']
+  };
+  const preset=presets[n];
+  for(let i=0;i<n;i++){
+    const sel=el('select');
+    sel.dataset.col=i;
+    ROLE_OPTIONS.forEach(r=>sel.appendChild(el('option',{text:r})));
+    if(preset && preset[i]) sel.value=preset[i];
+    const lbl=el('div', null, el('label',{text:'列 '+(i+1)}), sel);
+    host.appendChild(lbl);
+  }
+}
+$('cols').addEventListener('change', buildColMap);
+buildColMap();
+
+/* =========================================================================
+   銀行別テンプレート（設定の保存・読込）
+   ========================================================================= */
+function gatherTemplate(){
+  return {
+    tool:'oculus', ver:'0.10',
+    rows:$('rows').value, cols:$('cols').value, colWidths:$('colWidths').value,
+    roles:[...$('colMap').querySelectorAll('select')].map(s=>s.value),
+    headerRows:$('headerRows').value, snapGrid:$('optSnapGrid').checked,
+    padPct:$('padPct').value, confTh:$('confTh').value,
+    binMethod:$('binMethod').value, ocrDpi:$('ocrDpi').value,
+    workerN:$('workerN').value,
+    descDict:$('descDict').value,
+    optLineRemove:$('optLineRemove').checked, optDenoise:$('optDenoise').checked,
+    optNumEng:$('optNumEng').checked, optRetry:$('optRetry').checked,
+    optPaddle:$('optPaddle').checked,
+    optTwoStage:$('optTwoStage').checked, optBlankSkip:$('optBlankSkip').checked,
+    optMultiPass:$('optMultiPass').checked, optNormalize:$('optNormalize').checked
+  };
+}
+function applyTemplate(t){
+  if(!t || typeof t!=='object'){ log('設定の形式が不正です。'); return; }
+  if(t.tool && t.tool!=='oculus'){ log('Oculus用の設定ファイルではありません（tool='+t.tool+'）。読込を中止しました。'); return; }
+  if(t.rows!=null) $('rows').value=t.rows;
+  if(t.cols!=null){ $('cols').value=t.cols; buildColMap(); }
+  if(Array.isArray(t.roles)){ const sels=[...$('colMap').querySelectorAll('select')]; t.roles.forEach((rv,i)=>{ if(sels[i]) sels[i].value=rv; }); }
+  if(t.colWidths!=null) $('colWidths').value=t.colWidths;
+  if(t.headerRows!=null) $('headerRows').value=t.headerRows;
+  if(t.snapGrid!=null) $('optSnapGrid').checked=t.snapGrid;
+  if(t.padPct!=null) $('padPct').value=t.padPct;
+  if(t.confTh!=null) $('confTh').value=t.confTh;
+  if(t.binMethod!=null) $('binMethod').value=t.binMethod;
+  if(t.ocrDpi!=null) $('ocrDpi').value=t.ocrDpi;
+  if(t.workerN!=null) $('workerN').value=t.workerN;
+  if(t.descDict!=null) $('descDict').value=t.descDict;
+  if(t.optLineRemove!=null) $('optLineRemove').checked=t.optLineRemove;
+  if(t.optDenoise!=null) $('optDenoise').checked=t.optDenoise;
+  if(t.optNumEng!=null) $('optNumEng').checked=t.optNumEng;
+  if(t.optPaddle!=null) $('optPaddle').checked=t.optPaddle;
+  if(t.optTwoStage!=null) $('optTwoStage').checked=t.optTwoStage;
+  if(t.optBlankSkip!=null) $('optBlankSkip').checked=t.optBlankSkip;
+  if(t.optRetry!=null) $('optRetry').checked=t.optRetry;
+  if(t.optMultiPass!=null && $('optMultiPass')) $('optMultiPass').checked=t.optMultiPass;
+  if(t.optNormalize!=null && $('optNormalize')) $('optNormalize').checked=t.optNormalize;
+  log('テンプレートを適用しました。');
+}
+$('tplSaveBtn').addEventListener('click',async ()=>{
+  const json=JSON.stringify(gatherTemplate(),null,2);
+  try{ localStorage.setItem('oculus_template_last', json); }catch(e){}
+  try{
+    const blob=new Blob([json],{type:'application/json'});
+    const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='oculus_template.json'; a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+    log('設定を保存しました（oculus_template.json）。ブラウザ内にも直近設定を保存しました。');
+  }catch(e){
+    log('設定ファイル保存に失敗しました: '+e.message);
+  }
+  try{ await navigator.clipboard.writeText(json); log('設定JSONをクリップボードにもコピーしました。'); }catch(e){}
+});
+$('tplLoadBtn').addEventListener('click',()=>$('tplFile').click());
+$('tplLoadLastBtn').addEventListener('click',()=>{
+  try{
+    const json=localStorage.getItem('oculus_template_last');
+    if(!json){ log('ブラウザ内に直近設定がありません。'); return; }
+    applyTemplate(JSON.parse(json));
+  }catch(e){ log('直近設定の復元に失敗: '+e.message); }
+});
+$('tplFile').addEventListener('change',async ()=>{
+  const f=$('tplFile').files[0]; if(!f) return;
+  try{ applyTemplate(JSON.parse(await f.text())); }
+  catch(e){ log('テンプレート読込失敗: '+e.message); }
+});
+
+/* =========================================================================
+   1) 読み込み（PDF or 画像）→ baseCanvas へ描画
+   ========================================================================= */
+$('fileInput').addEventListener('change', ()=>{ $('loadBtn').disabled = !($('fileInput').files.length && S.cvReady); });
+
+$('loadBtn').addEventListener('click', async ()=>{
+  const f=$('fileInput').files[0]; if(!f) return;
+  resetCorners();
+  S.pdfDoc=null;
+  try{
+    if(f.type==='application/pdf'){
+      S.srcKind='pdf';
+      const buf=await f.arrayBuffer();
+      S.pdfDoc=await pdfjsLib.getDocument({data:buf}).promise;
+      const p=Math.min(Math.max(1,parseInt($('pageNum').value)||1), S.pdfDoc.numPages);
+      await renderPdfPageToCanvas(p, $('baseCanvas'));
+      finalizeBase();
+      log('PDF読込: 全'+S.pdfDoc.numPages+'ページ。表示中=p'+p);
+    } else {
+      S.srcKind='img';
+      await renderImage(f);
+    }
+    $('stageEmpty').style.display='none';
+    $('canvasArea').style.display='block';
+    log('ページ表示完了 ('+S.baseW+'×'+S.baseH+'px)');
+  }catch(e){ log('読み込み失敗: '+e.message); }
+});
+
+// 指定ページを指定canvasに描画（複数ページOCRから再利用）
+async function renderPdfPageToCanvas(pageNo, canvas){
+  const page=await S.pdfDoc.getPage(pageNo);
+  const scale=parseFloat($('renderScale').value)||2.5;
+  const vp=page.getViewport({scale});
+  canvas.width=Math.round(vp.width); canvas.height=Math.round(vp.height);
+  await page.render({canvasContext:canvas.getContext('2d'), viewport:vp}).promise;
+  // ページ単位のリソースを解放（数百ページ処理でのメモリ蓄積を防ぐ）
+  try{ page.cleanup(); }catch(e){}
+}
+
+async function renderImage(file){
+  const url=URL.createObjectURL(file);
+  const im=new Image(); im.src=url; await im.decode();
+  const scale=parseFloat($('renderScale').value)||1;
+  const eff=Math.min(scale,2);
+  if(eff<scale) log('画像は表示・処理倍率を'+eff+'に制限しました（メモリ保護のため最大2倍）。');
+  const base=$('baseCanvas');
+  base.width=Math.round(im.naturalWidth*eff);
+  base.height=Math.round(im.naturalHeight*eff);
+  base.getContext('2d').drawImage(im,0,0,base.width,base.height);
+  URL.revokeObjectURL(url);
+  finalizeBase();
+}
+
+function finalizeBase(keepCorners){
+  const base=$('baseCanvas');
+  S.baseW=base.width; S.baseH=base.height;
+  const ov=$('overlay'); ov.width=base.width; ov.height=base.height;
+  if(!keepCorners) resetCorners(); else drawOverlay();
+}
+
+/* =========================================================================
+   2) 四隅クリック／ドラッグ微調整／ルーペ
+   ========================================================================= */
+const CORNER_NAMES=['左上','右上','右下','左下'];
+let _dragIdx=-1;          // ドラッグ中の点index（-1=なし）
+function evToImg(e){
+  const ov=$('overlay'); const r=ov.getBoundingClientRect();
+  const sx=S.baseW/r.width, sy=S.baseH/r.height;
+  const cx=(e.touches?e.touches[0].clientX:e.clientX);
+  const cy=(e.touches?e.touches[0].clientY:e.clientY);
+  return {x:(cx-r.left)*sx, y:(cy-r.top)*sy, clientX:cx, clientY:cy, rect:r};
+}
+function hitCorner(p){
+  // 表示縮尺を考慮した当たり判定（実ピクセルで半径20相当）
+  const ov=$('overlay'); const r=ov.getBoundingClientRect();
+  const tol=Math.max(14, S.baseW/ (r.width/22));
+  for(let i=0;i<S.corners.length;i++){
+    if(Math.hypot(S.corners[i].x-p.x, S.corners[i].y-p.y)<tol) return i;
+  }
+  return -1;
+}
+function onPointerDown(e){
+  if(!S.baseW) return;
+  const p=evToImg(e);
+  const hit=hitCorner(p);
+  if(hit>=0){ _dragIdx=hit; e.preventDefault(); showLoupe(p,hit); return; }
+  if(S.corners.length<4){
+    S.corners.push({x:p.x,y:p.y});
+    drawOverlay(); updateCornerTags();
+    if(S.corners.length<4) showLoupe(p, S.corners.length-1); else hideLoupe();
+    e.preventDefault();
+  }
+}
+function onPointerMove(e){
+  if(!S.baseW) return;
+  const p=evToImg(e);
+  if(_dragIdx>=0){
+    S.corners[_dragIdx]={x:Math.max(0,Math.min(S.baseW,p.x)), y:Math.max(0,Math.min(S.baseH,p.y))};
+    drawOverlay(); showLoupe(p,_dragIdx); e.preventDefault(); return;
+  }
+  // ホバー時はカーソル形状のみ変更（点上で move）
+  $('overlay').style.cursor = (hitCorner(p)>=0)?'move':'crosshair';
+}
+function onPointerUp(e){
+  if(_dragIdx>=0){ _dragIdx=-1; updateCornerTags(); hideLoupe(); }
+}
+const _ov=$('overlay');
+_ov.addEventListener('mousedown', onPointerDown);
+_ov.addEventListener('mousemove', onPointerMove);
+window.addEventListener('mouseup', onPointerUp);
+_ov.addEventListener('touchstart', onPointerDown, {passive:false});
+_ov.addEventListener('touchmove', onPointerMove, {passive:false});
+window.addEventListener('touchend', onPointerUp);
+
+$('resetCornersBtn').addEventListener('click', resetCorners);
+
+function resetCorners(){ S.corners=[]; _dragIdx=-1; hideLoupe(); drawOverlay(); updateCornerTags(); }
+function updateCornerTags(){
+  $('cornerTags').textContent =
+    (S.corners.length===4?'指定完了（点をドラッグで微調整可）':'指定中')+`（${S.corners.length}/4）`+
+    (S.corners.length<4?` 次: ${CORNER_NAMES[S.corners.length]}`:'');
+  $('runBtn').disabled = !(S.corners.length===4 && S.cvReady);
+}
+function drawOverlay(){
+  const ov=$('overlay'); if(!ov.width) return;
+  const ctx=ov.getContext('2d'); ctx.clearRect(0,0,ov.width,ov.height);
+  ctx.lineWidth=Math.max(2,ov.width/600); ctx.strokeStyle='#c4a04a'; ctx.fillStyle='#16223d';
+  if(S.corners.length>1){
+    ctx.beginPath(); ctx.moveTo(S.corners[0].x,S.corners[0].y);
+    for(let i=1;i<S.corners.length;i++) ctx.lineTo(S.corners[i].x,S.corners[i].y);
+    if(S.corners.length===4) ctx.closePath();
+    ctx.stroke();
+  }
+  S.corners.forEach((c,i)=>{
+    ctx.fillStyle='#16223d';
+    ctx.beginPath(); ctx.arc(c.x,c.y,ctx.lineWidth*3.5,0,7); ctx.fill();
+    ctx.strokeStyle='#fff'; ctx.lineWidth=Math.max(1,ov.width/1200); ctx.stroke();
+    ctx.lineWidth=Math.max(2,ov.width/600); ctx.strokeStyle='#c4a04a';
+    ctx.fillStyle='#fff'; ctx.font=`bold ${ctx.lineWidth*6}px sans-serif`;
+    ctx.fillText(i+1, c.x+ctx.lineWidth*4, c.y);
+  });
+}
+// ルーペ：cursor位置の周辺を拡大して円形に表示（倍率はスライダーで2〜6×）
+function showLoupe(p, idx){
+  if(!($('optLoupe')&&$('optLoupe').checked)){ hideLoupe(); return; }
+  const lp=$('loupe'); 
+  const size=160;
+  const zoom=Math.max(2,Math.min(6,parseFloat($('loupeZoom')&&$('loupeZoom').value)||3.5));
+  const srcSize=size/zoom;
+  const lc=lp.getContext('2d');
+  lc.clearRect(0,0,size,size);
+  lc.imageSmoothingEnabled=false;
+  try{
+    lc.drawImage($('baseCanvas'),
+      p.x-srcSize/2, p.y-srcSize/2, srcSize, srcSize, 0,0,size,size);
+  }catch(e){}
+  lc.strokeStyle='rgba(196,160,74,.95)'; lc.lineWidth=1.5;
+  lc.beginPath(); lc.moveTo(size/2,0); lc.lineTo(size/2,size); lc.moveTo(0,size/2); lc.lineTo(size,size/2); lc.stroke();
+  lc.fillStyle='#16223d'; lc.beginPath(); lc.arc(size/2,size/2,3,0,7); lc.fill();
+  const ovRect=$('overlay').getBoundingClientRect();
+  let left=(p.clientX-ovRect.left)+18, top=(p.clientY-ovRect.top)-size-18;
+  if(top<0) top=(p.clientY-ovRect.top)+18;
+  if(left+size>ovRect.width) left=(p.clientX-ovRect.left)-size-18;
+  lp.style.left=left+'px'; lp.style.top=top+'px'; lp.style.display='block';
+}
+function hideLoupe(){ const lp=$('loupe'); if(lp) lp.style.display='none'; }
+$('loupeZoom').addEventListener('input', e=>{ $('loupeZoomVal').textContent=e.target.value; });
+
+/* =========================================================================
+   4) OCR実行：透視変換 → 格子セル切り出し → Tesseract → 検算
+   ========================================================================= */
+let _sched=null;      // jpn+eng 用スケジューラ
+let _numSched=null;   // eng 用スケジューラ
+let _schedN=0;
+// 詳細設定の読み取り（要素が無い場合も安全な既定値）
+function cfg(){
+  return {
+    bin: ($('binMethod')&&$('binMethod').value)||'otsu',
+    dpi: String(parseInt($('ocrDpi')&&$('ocrDpi').value)||300),
+    padPct: Math.max(0,Math.min(25, parseInt($('padPct')&&$('padPct').value)||6)),
+    confTh: Math.max(0,Math.min(100, parseInt($('confTh')&&$('confTh').value)||60)),
+    headerRows: Math.max(0, parseInt($('headerRows')&&$('headerRows').value)||0),
+    snapGrid: $('optSnapGrid')?$('optSnapGrid').checked:true,
+    workerN: Math.max(1,Math.min(8, parseInt($('workerN')&&$('workerN').value)||2)),
+    twoStage: $('optTwoStage')?$('optTwoStage').checked:true,
+    blankSkip: $('optBlankSkip')?$('optBlankSkip').checked:true,
+    lineRemove: $('optLineRemove')?$('optLineRemove').checked:true,
+    denoise: $('optDenoise')?$('optDenoise').checked:true,
+    numEng: $('optNumEng')?$('optNumEng').checked:true,
+    retry: $('optRetry')?$('optRetry').checked:true,
+    multiPass: $('optMultiPass')?$('optMultiPass').checked:true,
+    normalize: $('optNormalize')?$('optNormalize').checked:true,
+    usePaddle: $('optPaddle')?$('optPaddle').checked:true,
+    showThumbs: $('optShowThumbs')?$('optShowThumbs').checked:true
+  };
+}
+// 低信頼セルの確認用に、切出し画像を小さなdataURL文字列へ（canvas参照は保持しない＝大量ページでもメモリ増を抑制）
+function makeThumbDataURL(srcCanvas, maxW){
+  try{
+    const mw=maxW||150;
+    const sc=Math.min(1, mw/(srcCanvas.width||mw));
+    const w=Math.max(1,Math.round((srcCanvas.width||mw)*sc));
+    const h=Math.max(1,Math.round((srcCanvas.height||20)*sc));
+    const t=document.createElement('canvas'); t.width=w; t.height=h;
+    t.getContext('2d').drawImage(srcCanvas,0,0,w,h);
+    return t.toDataURL('image/png');
+  }catch(e){ return null; }
+}
+async function makeWorker(langs){
+  return await Tesseract.createWorker(langs, 1, {
+    workerPath: './lib/worker.min.js',
+    corePath: './lib/core/',
+    langPath: './lib/',
+    gzip: true,
+    logger: m => {}
+  });
+}
+
+/* =========================================================================
+   ローカルAI: PaddleOCR 認識モデル（ONNX Runtime Web / 完全オフライン）
+   - 検出モデルは不要（セル切出しは既存の格子処理が担当）
+   - lib/ort.min.js + lib/ppocr/rec_japan.onnx + lib/ppocr/japan_dict.txt 設置で有効化
+   - 未設置・失敗時は自動でTesseractにフォールバック
+   ========================================================================= */
+let _ppSession=null, _ppDict=null, _ppState='none'; // none|ready|missing|error
+function ppStatusBadge(text, ok){
+  const b=$('ppStatus'); if(!b) return;
+  b.style.display='inline-block';
+  b.className='badge '+(ok?'ok':'warn');
+  b.textContent=text;
+}
+async function ensurePaddle(){
+  if(_ppState==='ready') return true;
+  if(_ppState==='missing'||_ppState==='error') return false; // 一度失敗したら再試行しない（毎回のfetch失敗ログを防ぐ）
+  if(typeof ort==='undefined'){ _ppState='missing'; ppStatusBadge('未設置(ort.min.jsなし)',false); return false; }
+  try{
+    // 簡易HTTPサーバ（COOP/COEPなし）でも動くようシングルスレッド固定
+    ort.env.wasm.wasmPaths='./lib/';
+    ort.env.wasm.numThreads=1;
+    const dictRes=await fetch('./lib/ppocr/japan_dict.txt');
+    if(!dictRes.ok) throw new Error('japan_dict.txt が見つかりません');
+    _ppDict=(await dictRes.text()).split(/\r?\n/);
+    while(_ppDict.length && _ppDict[_ppDict.length-1]==='') _ppDict.pop();
+    _ppSession=await ort.InferenceSession.create('./lib/ppocr/rec_japan.onnx',{executionProviders:['wasm']});
+    _ppState='ready';
+    ppStatusBadge('AI準備完了',true);
+    log('PaddleOCR(ローカルAI) 準備完了: 辞書'+_ppDict.length+'字 → 摘要・その他列に適用します。');
+    return true;
+  }catch(e){
+    _ppState='missing';
+    ppStatusBadge('未設置→Tesseract使用',false);
+    log('PaddleOCR未設置のため摘要はTesseractで読みます（'+e.message+'）。');
+    return false;
+  }
+}
+function paddleReady(){ return _ppState==='ready'; }
+// 1セルをPaddleOCR認識モデルで読む。PP-OCR標準前処理:
+// 高さ48へ等比縮小 → BGR → (x/255-0.5)/0.5 → CHW。出力[1,T,C]はsoftmax済み確率。
+async function paddleRecognize(canvas){
+  const H=48;
+  const scale=H/Math.max(1,canvas.height);
+  let W=Math.max(16, Math.round(canvas.width*scale));
+  W=Math.min(960, Math.ceil(W/8)*8);            // 幅は8の倍数・上限960
+  const c=document.createElement('canvas'); c.width=W; c.height=H;
+  const ctx=c.getContext('2d');
+  ctx.fillStyle='#fff'; ctx.fillRect(0,0,W,H);
+  ctx.imageSmoothingEnabled=true; ctx.imageSmoothingQuality='high';
+  ctx.drawImage(canvas, 0,0, Math.min(W,Math.round(canvas.width*scale)), H);
+  const img=ctx.getImageData(0,0,W,H).data;
+  const plane=H*W;
+  const data=new Float32Array(3*plane);
+  for(let y=0;y<H;y++){
+    for(let x=0;x<W;x++){
+      const i=(y*W+x)*4, p=y*W+x;
+      data[0*plane+p]=(img[i+2]/255-0.5)/0.5;   // B
+      data[1*plane+p]=(img[i+1]/255-0.5)/0.5;   // G
+      data[2*plane+p]=(img[i  ]/255-0.5)/0.5;   // R
+    }
+  }
+  const input=new ort.Tensor('float32', data, [1,3,H,W]);
+  const feeds={}; feeds[_ppSession.inputNames[0]]=input;
+  const out=await _ppSession.run(feeds);
+  const t=out[_ppSession.outputNames[0]];        // [1, T, classes]
+  const T=t.dims[1], C=t.dims[2], d=t.data;
+  // CTC貪欲デコード: blank=0、連続重複は1字に圧縮。クラス= blank + 辞書 + 空白。
+  let text='', confSum=0, confN=0, last=-1;
+  for(let s=0;s<T;s++){
+    const off=s*C;
+    let bi=0, bv=-1e9;
+    for(let k=0;k<C;k++){ const v=d[off+k]; if(v>bv){ bv=v; bi=k; } }
+    if(bi!==0 && bi!==last){
+      const di=bi-1;
+      const ch=(di<_ppDict.length)? _ppDict[di] : (di===_ppDict.length?' ':'');
+      text+=ch; confSum+=bv; confN++;
+    }
+    last=bi;
+  }
+  const conf=confN ? Math.round(Math.max(0,Math.min(1,confSum/confN))*100) : 0;
+  return {text:text.trim(), conf};
+}
+// 必要な数のワーカーでスケジューラを構築。ワーカー数変更時は旧プールを解放して作り直す。
+async function ensureSchedulers(n, numEng){
+  const needNum = !!numEng;
+  const hasNum = (_numSched && _numSched!==_sched);
+  if(_sched && _schedN===n && hasNum===needNum) return;
+  // 旧プールの解放（メモリリーク防止）
+  if(_sched){
+    log('ワーカープールを再構築します（旧プールを解放）…');
+    try{ if(_numSched && _numSched!==_sched) await _numSched.terminate(); }catch(e){}
+    try{ await _sched.terminate(); }catch(e){}
+    _sched=null; _numSched=null;
+  }
+  _schedN=n;
+  log('Tesseract ワーカープール生成中（jpn+eng ×'+n+(needNum?'、eng ×'+n:'')+'）…');
+  _sched=Tesseract.createScheduler();
+  for(let i=0;i<n;i++){ _sched.addWorker(await makeWorker(['jpn','eng'])); }
+  if(needNum){
+    _numSched=Tesseract.createScheduler();
+    for(let i=0;i<n;i++){ _numSched.addWorker(await makeWorker(['eng'])); }
+  } else {
+    _numSched=_sched;
+  }
+  log('ワーカープール準備完了。');
+}
+
+function parsePageRange(text, maxPage){
+  // "1-3,5" → [1,2,3,5]。空欄なら表示中ページ。範囲外は除外。
+  const t=(text||'').trim();
+  if(!t) return null;
+  const set=new Set();
+  t.split(',').forEach(part=>{
+    const m=part.trim().match(/^(\d+)\s*-\s*(\d+)$/);
+    if(m){ let a=+m[1],b=+m[2]; if(a>b)[a,b]=[b,a]; for(let i=a;i<=b;i++) if(i>=1&&i<=maxPage) set.add(i); }
+    else { const n=parseInt(part,10); if(n>=1&&n<=maxPage) set.add(n); }
+  });
+  return [...set].sort((a,b)=>a-b);
+}
+function setProgress(done,total,label){
+  $('progWrap').style.display='block';
+  $('progBar').style.width=(total?Math.round(done/total*100):0)+'%';
+  $('progText').textContent=label||(done+' / '+total);
+}
+// タスク関数の配列を同時実行数limitで消化する。
+// 一括enqueueしないため、中断時は実行中のセルが終わり次第すぐ止まる。
+async function runPool(taskFns, limit){
+  let i=0, active=0;
+  return new Promise(resolve=>{
+    const next=()=>{
+      if(i>=taskFns.length && active===0){ resolve(); return; }
+      while(active<limit && i<taskFns.length){
+        const fn=taskFns[i++]; active++;
+        fn().catch(()=>{}).then(()=>{ active--; next(); });
+      }
+    };
+    next();
+  });
+}
+
+$('abortBtn').addEventListener('click', ()=>{ S.abort=true; log('中断要求を受け付けました。現在のセル完了後に停止します。'); });
+
+/* =========================================================================
+   二段OCR支援：空白セル事前判定 / 再OCR対象行の特定 / 高解像度再切出し
+   ========================================================================= */
+// 前処理済みセルのインク量から空白を判定（4ピクセル毎サンプリングで高速化）。
+// 銀行明細は出金/入金の片方が毎行空欄のため、ここでOCRを省略すると速度・精度とも向上する。
+function cellLooksBlank(cell){
+  try{
+    const w=cell.width, h=cell.height;
+    if(!w || !h) return false;
+    const d=cell.getContext('2d').getImageData(0,0,w,h).data;
+    let ink=0;
+    for(let i=0;i<d.length;i+=16){ if(d[i]<100) ink++; }   // R成分のみ・4px毎
+    const sampled=Math.ceil(d.length/16);
+    return (ink<3) || (ink/sampled)<0.0045;                 // 保守的しきい値（かすれ文字を空白扱いしない）
+  }catch(e){ return false; }
+}
+// 1ページ分のOCR結果から、精密再OCRすべき行（検算不一致・低信頼・金額非数値・日付異常）を特定
+function rowsNeedingRetry(rows, roles, confTh){
+  const idxOut=roles.indexOf('出金'), idxIn=roles.indexOf('入金'), idxBal=roles.indexOf('残高'), idxDate=roles.indexOf('日付');
+  const need=new Set();
+  let prev=null, prevKey=null;
+  rows.forEach((row,r)=>{
+    let bad=false;
+    const cellOf=i=>(i>=0 ? (row[i]||{text:'',conf:0}) : null);
+    [idxOut,idxIn,idxBal].forEach(i=>{
+      const c=cellOf(i); if(!c) return;
+      if(c.text && (c.conf||0)<confTh) bad=true;
+      if(c.text && toNum(c.text)==null) bad=true;
+    });
+    if(idxDate>=0){
+      const dc=cellOf(idxDate);
+      if(dc && dc.text){
+        const pd=parseDateCell(dc.text);
+        if(!pd) bad=true;
+        else {
+          if(prevKey!=null && pd.key<prevKey){ bad=true; if(r>0) need.add(r-1); } // 逆行は前行誤読の可能性も
+          prevKey=pd.key;
+        }
+      }
+    }
+    if(idxBal>=0){
+      const bal=toNum(cellOf(idxBal).text);
+      const o=idxOut>=0?(toNum(cellOf(idxOut).text)||0):0;
+      const inn=idxIn>=0?(toNum(cellOf(idxIn).text)||0):0;
+      if(prev!=null){
+        if(bal==null) bad=true;
+        else if(prev+inn-o!==bal) bad=true;
+      }
+      if(bal!=null) prev=bal;
+    }
+    if(bad) need.add(r);
+  });
+  return [...need].sort((a,b)=>a-b);
+}
+// レイアウトの1行（絶対行index）だけセル切出し
+function sliceOneRow(warped, lay, r, C){
+  const rE=lay.rowBounds, cE=lay.colEdges;
+  if(r<0 || r>=rE.length-1) return null;
+  const rowH=rE[r+1]-rE[r];
+  const padY=Math.round(rowH*C.padPct/100);
+  const y0=rE[r]+padY, y1=rE[r+1]-padY;
+  const out=[];
+  for(let c=0;c<cE.length-1;c++){
+    const colW=cE[c+1]-cE[c];
+    const padX=Math.round(colW*C.padPct/100);
+    const x0=cE[c]+padX, x1=cE[c+1]-padX;
+    const cw=Math.max(1,x1-x0), ch=Math.max(1,y1-y0);
+    const raw=document.createElement('canvas'); raw.width=cw; raw.height=ch;
+    raw.getContext('2d').drawImage(warped,x0,y0,cw,ch,0,0,cw,ch);
+    const cell=cloneCanvas(raw);
+    preprocessCell(cell);
+    cell.__raw=raw;
+    out.push(cell);
+  }
+  return out;
+}
+// PDFページを高解像度で再描画し、指定行（絶対行index）のセルを再切出しする。
+// 画像入力や倍率上限到達時は null（既存セルで精密再OCRのみ行う）。
+async function buildHiResCells(pageNo, layout, corners, absRows, C){
+  if(pageNo==null || !S.pdfDoc) return null;
+  const baseScale=parseFloat($('renderScale').value)||2.5;
+  const k=Math.min(1.8, 5/baseScale);
+  if(k<=1.05) return null;
+  let cnv=null, warped=null;
+  try{
+    const page=await S.pdfDoc.getPage(pageNo);
+    const vp=page.getViewport({scale: baseScale*k});
+    cnv=document.createElement('canvas');
+    cnv.width=Math.round(vp.width); cnv.height=Math.round(vp.height);
+    await page.render({canvasContext:cnv.getContext('2d'), viewport:vp}).promise;
+    try{ page.cleanup(); }catch(e){}
+    const c2=corners.map(p=>({x:p.x*k, y:p.y*k}));
+    warped=warpToGrid(c2, cnv);
+    cnv.width=0; cnv.height=0; cnv=null;
+    const lay2={rowBounds:layout.rowBounds.map(v=>Math.round(v*k)), colEdges:layout.colEdges.map(v=>Math.round(v*k))};
+    const map=new Map();
+    for(const ar of absRows){
+      const cellsRow=sliceOneRow(warped, lay2, ar, C);
+      if(cellsRow) map.set(ar, cellsRow);
+    }
+    return map;
+  }catch(e){ log('高解像度再描画に失敗（既存セルで再OCRします）: '+e.message); return null; }
+  finally{
+    if(cnv){ cnv.width=0; cnv.height=0; }
+    if(warped){ warped.width=0; warped.height=0; }
+  }
+}
+
+// 結果から摘要辞書へ学習：高信頼または手修正済みの摘要を辞書に追加
+$('dictLearnBtn').addEventListener('click', ()=>{
+  if(!S.lastRows || !S.lastRows.length){ log('先にOCRを実行してください。'); return; }
+  const roles=rolesByIndex();
+  const idx=roles.indexOf('摘要');
+  if(idx<0){ log('摘要列が割り当てられていません。'); return; }
+  const C=cfg();
+  const have=new Set(parseDescDict().map(t=>t.norm));
+  const added=[];
+  for(const row of S.lastRows){
+    const cell=row[idx]; if(!cell) continue;
+    const t=(cell.text||'').trim();
+    if(t.length<2) continue;
+    // 信頼できるものだけ学習（手修正 or 高信頼。辞書補正済みは元から辞書にある）
+    if(!(cell.userEdited || (!cell.dictFixed && (cell.conf||0)>=Math.max(C.confTh,85)))) continue;
+    const n=normForDict(t);
+    if(have.has(n)) continue;
+    have.add(n); added.push(t);
+  }
+  if(added.length){
+    const ta=$('descDict');
+    ta.value=(ta.value.trim()? ta.value.replace(/\s+$/,'')+'\n':'')+added.join('\n');
+    log('摘要辞書に '+added.length+' 語を追加しました。テンプレート保存で次回に持ち越せます。');
+  } else {
+    log('追加できる新しい摘要がありませんでした（既登録か、信頼度不足）。');
+  }
+});
+
+$('runBtn').addEventListener('click', async ()=>{
+  if(S.corners.length!==4){ log('四隅が未指定です。'); return; }
+  const C=cfg();
+  if(!validateRunSettings()) return;
+
+  // 対象ページの決定（画像 or PDFで表示中のみ or 範囲指定）
+  let pages=[null]; // null=現在のbaseCanvas
+  if(S.srcKind==='pdf' && S.pdfDoc){
+    const range=parsePageRange($('pageRange').value, S.pdfDoc.numPages);
+    if(range && range.length){ pages=range; }
+    else { pages=[Math.min(Math.max(1,parseInt($('pageNum').value)||1), S.pdfDoc.numPages)]; }
+  }
+
+  // 大量ページの事前確認（所要時間のごく粗い目安つき）
+  if(pages.length>=30){
+    const rowsGuess=parseInt($('rows').value)||20;
+    const colsGuess=parseInt($('cols').value)||4;
+    // 1セルあたりの概算（並列・多段の有無で大きく変わるためレンジ表示）
+    const perCell = (C.multiPass && !C.twoStage)?0.45 : (C.twoStage?0.16:0.18);
+    const secs = Math.round(pages.length*rowsGuess*colsGuess*perCell / C.workerN);
+    const mm=Math.floor(secs/60), ss=secs%60;
+    const est=(mm>0?mm+'分':'')+ss+'秒';
+    const msg=pages.length+'ページを処理します。\n概算セル数 約'+(pages.length*rowsGuess*colsGuess).toLocaleString()
+      +' ／ 目安 約'+est+'（環境により大きく変動）。\n\n途中で「中断」でき、そこまでの結果は表示されます。実行しますか？';
+    if(!(await showConfirmDialog(msg,{title:'大量ページOCRの確認', okText:'OCRを実行', cancelText:'中止'}))){ log('実行を取りやめました。'); return; }
+  }
+
+  $('runBtn').disabled=true; $('abortBtn').disabled=false; S.abort=false;
+  const t0=performance.now();
+  try{
+    await ensureSchedulers(C.workerN, C.numEng);
+    if(C.usePaddle) await ensurePaddle();   // 未設置なら自動的にTesseractへ
+    log('OCR対象ページ: '+(pages.length>20? pages.length+'ページ' : pages.map(p=>p==null?'(表示中)':p).join(', ')));
+
+    // 四隅は「指定した時点のページ寸法」を基準として記録し、寸法が異なるページでは比例換算する
+    const refW=S.baseW, refH=S.baseH;
+    const baseCorners=S.corners.map(c=>({x:c.x, y:c.y}));
+    let scaleWarned=false;
+
+    const allRows=[];
+    let prevBalCarry=null;        // ページ跨ぎの残高連鎖
+    let cellDoneGlobal=0, estTotal=0;
+    let blankSkipTotal=0, phase2Total=0;
+
+    for(let pi=0; pi<pages.length; pi++){
+      if(S.abort) break;
+      const pageNo=pages[pi];
+      if(pageNo!=null){
+        await renderPdfPageToCanvas(pageNo, $('baseCanvas'));
+        finalizeBase(true);  // 四隅は維持
+      }
+      // ページ寸法が基準と異なる場合は四隅を比例換算（縦横混在PDF対策）
+      let corners=baseCorners;
+      if(S.baseW!==refW || S.baseH!==refH){
+        const sx=S.baseW/refW, sy=S.baseH/refH;
+        corners=baseCorners.map(c=>({x:c.x*sx, y:c.y*sy}));
+        if(!scaleWarned){ log('⚠ p'+pageNo+': ページ寸法が基準('+refW+'×'+refH+')と異なるため四隅を比例換算（精度低下の可能性。要確認行に注意）。'); scaleWarned=true; }
+      }
+      let warped = warpToGrid(corners);
+      const layout = computeGrid(warped, C);
+      const cells = sliceCellsByLayout(warped, layout, C);
+      const dataCells = cells.slice(C.headerRows); // ヘッダ行除外
+      const rN=dataCells.length, cN=(dataCells[0]?.length||0);
+      // 全体総数は1ページ目の確定セル数×ページ数で推定（同一レイアウト前提・進捗バー安定化）
+      if(pi===0) estTotal=Math.max(1, rN*cN*pages.length);
+
+      const roles=rolesByIndex();
+      const rows=new Array(rN);
+      const taskFns=[];
+      // Phase1: 高速設定（二段OCR時はmultiPassを切る。Phase2で必要箇所だけ精密化）
+      const C1 = C.twoStage ? Object.assign({}, C, {multiPass:false}) : C;
+      for(let r=0;r<rN;r++){
+        rows[r]=new Array(dataCells[r].length);
+        for(let c=0;c<dataCells[r].length;c++){
+          const role=roles[c], rr=r, cc=c;
+          taskFns.push(async()=>{
+            if(S.abort) { rows[rr][cc]={text:'',conf:0,__aborted:true}; return; }
+            try{
+              if(C.blankSkip && cellLooksBlank(dataCells[rr][cc])){
+                rows[rr][cc]={text:'', rawText:'', conf:99, blankSkip:true};
+                blankSkipTotal++;
+              } else {
+                const best=await recognizeCellRole(dataCells[rr][cc], role, C1);
+                rows[rr][cc]=best || {text:'', rawText:'', conf:0, error:true};
+              }
+            }catch(e){
+              rows[rr][cc]={text:'', rawText:'OCR失敗: '+(e&&e.message?e.message:String(e)), conf:0, error:true};
+              log('セルOCR失敗 r'+(rr+1)+' c'+(cc+1)+': '+(e&&e.message?e.message:String(e)));
+            }
+            cellDoneGlobal++;
+            if((cellDoneGlobal & 7)===0 || cellDoneGlobal===estTotal){
+              const elapsed=(performance.now()-t0)/1000;
+              const rate=cellDoneGlobal/Math.max(0.001,elapsed);
+              const remain=Math.max(0, estTotal-cellDoneGlobal)/Math.max(0.001,rate);
+              setProgress(cellDoneGlobal, estTotal,
+                'ページ '+(pi+1)+'/'+pages.length+' ・ '+cellDoneGlobal+'/'+estTotal+' セル ・ 残り約'+Math.round(remain)+'秒');
+            }
+          });
+        }
+      }
+      // 同時実行はワーカー数×2に制限（中断時は実行中セル完了後すぐ停止）
+      await runPool(taskFns, Math.max(2, C.workerN*2));
+
+      // Phase2: 検算が合わない行だけ精密再OCR（PDFは高解像度で再切出し）
+      if(C.twoStage && !S.abort){
+        const needs=rowsNeedingRetry(rows, roles, C.confTh);
+        if(needs.length){
+          setProgress(cellDoneGlobal, estTotal, 'ページ '+(pi+1)+'/'+pages.length+' ・ 精密再OCR '+needs.length+'行');
+          const absRows=needs.map(r=>r+C.headerRows);
+          const hiMap=await buildHiResCells(pageNo, layout, corners, absRows, C);
+          log('p'+(pageNo??'表示中')+': 要再OCR '+needs.length+'行を精密再読'+(hiMap?'（高解像度）':''));
+          const targetCols=[roles.indexOf('日付'),roles.indexOf('出金'),roles.indexOf('入金'),roles.indexOf('残高')].filter(i=>i>=0);
+          const fns2=[];
+          for(const r of needs){
+            const hiRow=hiMap ? hiMap.get(r+C.headerRows) : null;
+            for(const ci of targetCols){
+              const srcCell=(hiRow && hiRow[ci]) || dataCells[r][ci];
+              const rr=r, cc=ci;
+              fns2.push(async()=>{
+                if(S.abort) return;
+                try{
+                  const nb=await recognizeCellRole(srcCell, roles[cc], C);   // フル精度設定
+                  const ob=rows[rr][cc]||{text:'',conf:0};
+                  const merged=betterOcrCandidate(ob, nb, roles[cc]);
+                  // 修復用候補は両パスの和集合（高解像度・別前処理の読みが候補に増える）
+                  merged.alts=dedupeOcrCandidates(
+                    [...(ob.alts||[]), ...(nb.alts||[]),
+                     {text:ob.text, rawText:ob.rawText, conf:ob.conf},
+                     {text:nb.text, rawText:nb.rawText, conf:nb.conf}], roles[cc]).slice(0,12);
+                  merged.reOcr=true;
+                  rows[rr][cc]=merged;
+                  phase2Total++;
+                }catch(e){}
+              });
+            }
+          }
+          await runPool(fns2, Math.max(2, C.workerN*2));
+        }
+      }
+
+      // 中断時、まったく処理されなかった行は結果から除く
+      const doneRows = S.abort ? rows.filter(row=>!row.every(cell=>cell&&cell.__aborted)) : rows;
+      normalizeResultRows(doneRows, cN);
+      if(S.abort){ log('中断しました（p'+(pageNo??'表示中')+'の途中、有効'+doneRows.length+'行まで）。'); }
+
+      const carry=applyBalanceCandidateRepair(doneRows, roles, C.confTh, prevBalCarry);
+      prevBalCarry=carry.lastBal;
+      const dictFixed=applyDescDictionary(doneRows, roles);
+      if(dictFixed) log('p'+(pageNo??'表示中')+': 摘要辞書補正 '+dictFixed+'セル');
+      doneRows.forEach(row=>{ row.__page=pageNo; });
+      allRows.push(...doneRows);
+
+      // ページ単位のメモリ解放：切出しcanvas群と補正後canvasの参照を断つ
+      for(const rowArr of cells){ for(const cv2 of rowArr){ if(cv2){ cv2.__raw=null; cv2.width=0; cv2.height=0; } } }
+      if(warped){ warped.width=0; warped.height=0; warped=null; }
+      if(S.abort) break;
+      // 数十ページごとにUIへ制御を返す（描画・GCの機会）
+      if((pi%20)===19) await new Promise(r=>setTimeout(r,0));
+    }
+
+    S.lastRows=allRows;
+    renderResults(allRows);
+    $('exportBtn').disabled = allRows.length===0;
+    const secs=Math.round((performance.now()-t0)/1000);
+    setProgress(cellDoneGlobal, estTotal||1, (S.abort?'中断（部分結果）':'完了')+' ・ '+allRows.length+'行 ・ '+secs+'秒');
+    log((S.abort?'中断':'完了')+': '+allRows.length+'行 / '+secs+'秒'
+        +(blankSkipTotal?'（空白省略 '+blankSkipTotal+'セル':'')
+        +(phase2Total?(blankSkipTotal?'・':'（')+'精密再OCR '+phase2Total+'セル）':(blankSkipTotal?'）':'')));
+  }catch(e){ log('OCRエラー: '+e.message); console.error(e); }
+  finally{ $('runBtn').disabled=false; $('abortBtn').disabled=true; }
+});
+
+// 透視変換：四隅 → 既知矩形へ（cornersOverrideでページごとの換算済み座標を渡せる）
+function warpToGrid(cornersOverride, srcCanvas){
+  const base=srcCanvas||$('baseCanvas');
+  const src=cv.imread(base);
+  const c=cornersOverride||S.corners;
+  // 出力サイズは四隅から推定
+  const wTop=Math.hypot(c[1].x-c[0].x, c[1].y-c[0].y);
+  const wBot=Math.hypot(c[2].x-c[3].x, c[2].y-c[3].y);
+  const hL=Math.hypot(c[3].x-c[0].x, c[3].y-c[0].y);
+  const hR=Math.hypot(c[2].x-c[1].x, c[2].y-c[1].y);
+  const W=Math.round(Math.max(wTop,wBot)), H=Math.round(Math.max(hL,hR));
+  let srcTri,dstTri,M,dst;
+  const out=document.createElement('canvas'); out.width=W; out.height=H;
+  try{
+    srcTri=cv.matFromArray(4,1,cv.CV_32FC2,[c[0].x,c[0].y, c[1].x,c[1].y, c[2].x,c[2].y, c[3].x,c[3].y]);
+    dstTri=cv.matFromArray(4,1,cv.CV_32FC2,[0,0, W,0, W,H, 0,H]);
+    M=cv.getPerspectiveTransform(srcTri,dstTri);
+    dst=new cv.Mat();
+    cv.warpPerspective(src,dst,M,new cv.Size(W,H),cv.INTER_LINEAR,cv.BORDER_CONSTANT,new cv.Scalar(255,255,255,255));
+    cv.imshow(out,dst);
+  } finally {
+    if(src) src.delete(); if(dst) dst.delete(); if(M) M.delete();
+    if(srcTri) srcTri.delete(); if(dstTri) dstTri.delete();
+  }
+  return out;
+}
+
+/* =========================================================================
+   格子レイアウト：罫線自動検出による行境界吸着（失敗時は均等分割）
+   ========================================================================= */
+// 補正後canvasから水平/垂直罫線の位置を射影プロファイルで検出
+function detectLines(warped){
+  let src,gray,bin,inv;
+  try{
+    src=cv.imread(warped);
+    gray=new cv.Mat(); cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY);
+    bin=new cv.Mat(); cv.threshold(gray,bin,0,255,cv.THRESH_BINARY_INV+cv.THRESH_OTSU); // 線=白
+    const W=bin.cols, H=bin.rows;
+    // 水平線: 横方向に長く連続する成分を抽出して行ごとの白画素数を集計
+    const hk=cv.getStructuringElement(cv.MORPH_RECT,new cv.Size(Math.max(15,Math.round(W*0.4)),1));
+    const vk=cv.getStructuringElement(cv.MORPH_RECT,new cv.Size(1,Math.max(15,Math.round(H*0.4))));
+    const hLines=new cv.Mat(), vLines=new cv.Mat();
+    cv.morphologyEx(bin,hLines,cv.MORPH_OPEN,hk);
+    cv.morphologyEx(bin,vLines,cv.MORPH_OPEN,vk);
+    const rowProfile=new Array(H).fill(0), colProfile=new Array(W).fill(0);
+    const hData=hLines.data, vData=vLines.data;
+    for(let y=0;y<H;y++){ let s=0; const off=y*W; for(let x=0;x<W;x++) if(hData[off+x]) s++; rowProfile[y]=s; }
+    for(let x=0;x<W;x++){ let s=0; for(let y=0;y<H;y++) if(vData[y*W+x]) s++; colProfile[x]=s; }
+    hk.delete(); vk.delete(); hLines.delete(); vLines.delete();
+    const hPos=peaks(rowProfile, W*0.5, Math.max(3,Math.round(H*0.01)));
+    const vPos=peaks(colProfile, H*0.5, Math.max(3,Math.round(W*0.01)));
+    return {hPos, vPos, W, H};
+  } catch(e){ return null; }
+  finally{ if(src)src.delete(); if(gray)gray.delete(); if(bin)bin.delete(); if(inv)inv.delete(); }
+}
+// プロファイルから閾値超えの極大位置をクラスタ統合して返す
+function peaks(profile, minVal, minGap){
+  const idx=[];
+  for(let i=0;i<profile.length;i++) if(profile[i]>=minVal) idx.push(i);
+  if(!idx.length) return [];
+  const clusters=[]; let start=idx[0], prev=idx[0];
+  for(let k=1;k<idx.length;k++){
+    if(idx[k]-prev>minGap){ clusters.push(Math.round((start+prev)/2)); start=idx[k]; }
+    prev=idx[k];
+  }
+  clusters.push(Math.round((start+prev)/2));
+  return clusters;
+}
+// 行境界・列境界を決める。吸着可なら罫線位置を、不可なら均等/比率分割を使う。
+function computeGrid(warped, C){
+  const W=warped.width, H=warped.height;
+  let rowBounds=null, colEdges=null, snapped={row:false,col:false};
+
+  if(C.snapGrid){
+    const det=detectLines(warped);
+    if(det){
+      // 行: 端(0,H)を含めて昇順。間隔が極端に狭いものは統合済み。
+      if(det.hPos.length>=3){
+        let hs=[...det.hPos];
+        if(hs[0]>H*0.02) hs.unshift(0);
+        if(hs[hs.length-1]<H*0.98) hs.push(H);
+        // 隣接境界が近すぎる場合は除外
+        hs=mergeClose(hs, H*0.012);
+        if(hs.length>=2){
+          rowBounds=hs; snapped.row=true;
+          const detRows=hs.length-1;
+          if($('rows')) $('rows').value=detRows; // 行数を検出結果で上書き
+          log('罫線検出: 行境界 '+hs.length+'本 → '+detRows+'行に吸着。');
+        }
+      }
+      // 列: 設定列数と検出数（端含む）が一致した時だけ吸着
+      const cols=parseInt($('cols').value)||1;
+      if(det.vPos.length){
+        let vs=[...det.vPos];
+        if(vs[0]>W*0.02) vs.unshift(0);
+        if(vs[vs.length-1]<W*0.98) vs.push(W);
+        vs=mergeClose(vs, W*0.012);
+        if(vs.length-1===cols){ colEdges=vs; snapped.col=true; log('罫線検出: 列境界を吸着（'+cols+'列）。'); }
+      }
+    }
+    if(!snapped.row) log('行の罫線吸着に失敗 → 均等分割を使用。');
+  }
+
+  if(!rowBounds){
+    const rows=parseInt($('rows').value)||1;
+    rowBounds=[]; for(let r=0;r<=rows;r++) rowBounds.push(Math.round(H*r/rows));
+  }
+  if(!colEdges){ colEdges=colEdgesFor(W); }
+  return {rowBounds, colEdges, W, H, snapped};
+}
+function mergeClose(arr, minGap){
+  const out=[arr[0]];
+  for(let i=1;i<arr.length;i++){ if(arr[i]-out[out.length-1]>=minGap) out.push(arr[i]); }
+  return out;
+}
+
+function colEdgesFor(W){
+  const cols=parseInt($('cols').value)||1;
+  const raw=($('colWidths').value||'').split(',').map(s=>parseFloat(s)).filter(v=>v>0);
+  let weights = (raw.length===cols)? raw : new Array(cols).fill(1);
+  const total=weights.reduce((a,b)=>a+b,0);
+  const edges=[0]; let acc=0;
+  weights.forEach(w=>{ acc+=w; edges.push(Math.round(W*acc/total)); });
+  return edges;
+}
+function drawGridOverlay(ctx, layout){
+  ctx.strokeStyle='rgba(196,160,74,.9)'; ctx.lineWidth=Math.max(1,layout.W/900);
+  layout.rowBounds.forEach(y=>{ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(layout.W,y); ctx.stroke(); });
+  layout.colEdges.forEach(x=>{ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,layout.H); ctx.stroke(); });
+  // ヘッダ行を薄く塗る
+  const C=cfg();
+  if(C.headerRows>0 && layout.rowBounds.length>C.headerRows){
+    ctx.fillStyle='rgba(31,79,122,.12)';
+    ctx.fillRect(0,layout.rowBounds[0],layout.W,layout.rowBounds[C.headerRows]-layout.rowBounds[0]);
+  }
+}
+function renderWarpedPreview(warped, layout){
+  const prev=$('warpedCanvas'); prev.width=layout.W; prev.height=layout.H;
+  const pctx=prev.getContext('2d'); pctx.drawImage(warped,0,0);
+  drawGridOverlay(pctx, layout);
+  $('warpedArea').style.display='block';
+}
+
+// レイアウト（行境界・列境界）に基づきセルを切り出す
+function sliceCellsByLayout(warped, layout, C){
+  renderWarpedPreview(warped, layout);
+  const {rowBounds, colEdges}=layout;
+  const padPct=C.padPct;
+  const grid=[];
+  for(let r=0;r<rowBounds.length-1;r++){
+    const y0r=rowBounds[r], y1r=rowBounds[r+1];
+    const rowH=y1r-y0r;
+    const padY=Math.round(rowH*padPct/100);
+    const y0=y0r+padY, y1=y1r-padY;
+    const rowArr=[];
+    for(let c=0;c<colEdges.length-1;c++){
+      const colW=colEdges[c+1]-colEdges[c];
+      const padX=Math.round(colW*padPct/100);
+      const x0=colEdges[c]+padX, x1=colEdges[c+1]-padX;
+      const cw=Math.max(1,x1-x0), ch=Math.max(1,y1-y0);
+      const raw=document.createElement('canvas'); raw.width=cw; raw.height=ch;
+      raw.getContext('2d').drawImage(warped,x0,y0,cw,ch,0,0,cw,ch);
+      const cell=cloneCanvas(raw);
+      preprocessCell(cell);
+      cell.__raw=raw;   // 再OCR用に前処理前のセルを保持
+      rowArr.push(cell);
+    }
+    grid.push(rowArr);
+  }
+  return grid;
+}
+
+// セル前処理：拡大 → グレースケール → (ノイズ除去) → 2値化 → (罫線除去/境界クリア)
+function preprocessCell(cell, overrideCfg){
+  const C=Object.assign({}, cfg(), overrideCfg||{});
+  let m,g,b;
+  try{
+    const targetH=48;
+    if(cell.height>0 && cell.height<targetH){
+      const sc=Math.min(4, targetH/cell.height);
+      const big=document.createElement('canvas');
+      big.width=Math.max(1,Math.round(cell.width*sc)); big.height=Math.round(cell.height*sc);
+      const bctx=big.getContext('2d'); bctx.imageSmoothingEnabled=true; bctx.imageSmoothingQuality='high';
+      bctx.drawImage(cell,0,0,big.width,big.height);
+      cell.width=big.width; cell.height=big.height;
+      cell.getContext('2d').drawImage(big,0,0);
+    }
+    m=cv.imread(cell);
+    g=new cv.Mat(); cv.cvtColor(m,g,cv.COLOR_RGBA2GRAY);
+    if(C.denoise){ const t=new cv.Mat(); cv.medianBlur(g,t,3); g.delete(); g=t; }
+    b=new cv.Mat();
+    if(C.bin==='adaptive'){
+      let bs=31; const mn=Math.min(g.rows,g.cols);
+      if(bs>=mn){ bs=Math.floor(mn/2)*2-1; } if(bs<3){ bs=3; }
+      cv.adaptiveThreshold(g,b,255,cv.ADAPTIVE_THRESH_GAUSSIAN_C,cv.THRESH_BINARY,bs,15);
+    } else if(C.bin==='none'){
+      g.copyTo(b);
+    } else {
+      cv.threshold(g,b,0,255,cv.THRESH_BINARY+cv.THRESH_OTSU);
+    }
+    if(C.lineRemove){ removeLines(b); clearBorder(b, Math.max(2,Math.round(Math.min(b.rows,b.cols)*0.04))); }
+    cv.imshow(cell,b);
+  }catch(e){ /* 前処理失敗時は原画像のまま */ }
+  finally{ if(m)m.delete(); if(g)g.delete(); if(b)b.delete(); }
+}
+
+// 長い水平・垂直線（罫線）を白で消す。文字の短いストロークは残す。
+function removeLines(b){
+  let inv,hk,vk,hl,vl,lines,cleaned,rk;
+  try{
+    inv=new cv.Mat(); cv.bitwise_not(b,inv);   // 文字=白, 背景=黒
+    hk=cv.getStructuringElement(cv.MORPH_RECT,new cv.Size(Math.max(12,Math.round(b.cols*0.5)),1));
+    vk=cv.getStructuringElement(cv.MORPH_RECT,new cv.Size(1,Math.max(12,Math.round(b.rows*0.6))));
+    hl=new cv.Mat(); vl=new cv.Mat();
+    cv.morphologyEx(inv,hl,cv.MORPH_OPEN,hk);
+    cv.morphologyEx(inv,vl,cv.MORPH_OPEN,vk);
+    lines=new cv.Mat(); cv.add(hl,vl,lines);
+    cleaned=new cv.Mat(); cv.subtract(inv,lines,cleaned);
+    rk=cv.getStructuringElement(cv.MORPH_RECT,new cv.Size(2,2));
+    cv.morphologyEx(cleaned,cleaned,cv.MORPH_CLOSE,rk);   // 罫線除去で途切れた文字を軽く補修
+    cv.bitwise_not(cleaned,b);
+  }catch(e){}
+  finally{
+    if(hk)hk.delete(); if(vk)vk.delete(); if(hl)hl.delete(); if(vl)vl.delete();
+    if(lines)lines.delete(); if(cleaned)cleaned.delete(); if(rk)rk.delete(); if(inv)inv.delete();
+  }
+}
+
+// 枠際 px ピクセルを白で塗り、残った罫線片を消す
+function clearBorder(b,px){
+  try{
+    if(px<=0) return;
+    const w=new cv.Scalar(255);
+    cv.rectangle(b,new cv.Point(0,0),new cv.Point(b.cols-1,px),w,-1);
+    cv.rectangle(b,new cv.Point(0,b.rows-1-px),new cv.Point(b.cols-1,b.rows-1),w,-1);
+    cv.rectangle(b,new cv.Point(0,0),new cv.Point(px,b.rows-1),w,-1);
+    cv.rectangle(b,new cv.Point(b.cols-1-px,0),new cv.Point(b.cols-1,b.rows-1),w,-1);
+  }catch(e){}
+}
+
+
+/* =========================================================================
+   OCR後処理・多段認識
+   ========================================================================= */
+function cloneCanvas(src){
+  const dst=document.createElement('canvas');
+  dst.width=src.width; dst.height=src.height;
+  dst.getContext('2d').drawImage(src,0,0);
+  return dst;
+}
+function makeVariant(raw, overrideCfg){
+  const c=cloneCanvas(raw);
+  preprocessCell(c, overrideCfg||{});
+  return c;
+}
+function normalizeZenkaku(s){
+  return (s||'').replace(/[０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0)-0xFEE0))
+                .replace(/[，]/g, ',').replace(/[．]/g,'.')
+                .replace(/[－―ー−]/g,'-');
+}
+function normalizeAmountText(s){
+  let t=normalizeZenkaku(s).trim();
+  // 金額欄に出やすいOCR誤変換だけを限定的に補正する
+  t=t.replace(/[Oo〇○]/g,'0')
+     .replace(/[Il|!]/g,'1')
+     .replace(/[Ss]/g,'5')
+     .replace(/[Bb]/g,'8')
+     .replace(/[Zz]/g,'2')
+     .replace(/[Gg]/g,'6')
+     .replace(/[q]/g,'9')
+     .replace(/[¥￥円\s]/g,'');
+  // 小数点は金額では桁区切り誤読の可能性が高いので除去
+  t=t.replace(/\.(?=\d{3}(\D|$))/g, ',');
+  return t;
+}
+function normalizeDateText(s){
+  let t=normalizeZenkaku(s).trim();
+  t=t.replace(/[Oo〇○]/g,'0').replace(/[Il|!]/g,'1').replace(/[Ss]/g,'5').replace(/[Bb]/g,'8');
+  t=t.replace(/[年月.\-]/g,'/').replace(/日/g,'').replace(/\s+/g,'');
+  t=t.replace(/\/+/g,'/');
+  return t;
+}
+function normalizeByRole(text, role){
+  if(role==='出金'||role==='入金'||role==='残高') return normalizeAmountText(text);
+  if(role==='日付') return normalizeDateText(text);
+  return (text||'').trim().replace(/\s+/g,'');
+}
+function amountParseable(s){
+  if(!s) return true; // 空欄は金額0として扱えるため失敗扱いにしない
+  return /[0-9]/.test(normalizeAmountText(s));
+}
+function betterOcrCandidate(a,b,role){
+  if(!a) return b;
+  if(!b) return a;
+  const aText=a.text||'', bText=b.text||'';
+  const aUseful=(role==='出金'||role==='入金'||role==='残高') ? amountParseable(aText) : !!aText;
+  const bUseful=(role==='出金'||role==='入金'||role==='残高') ? amountParseable(bText) : !!bText;
+  if(aUseful!==bUseful) return bUseful?b:a;
+  // 数値欄は信頼度だけでなく、桁を含む候補を優先
+  if((role==='出金'||role==='入金'||role==='残高') && (/\d/.test(bText)!==/\d/.test(aText))) return /\d/.test(bText)?b:a;
+  return (b.conf>a.conf)?b:a;
+}
+function ocrVariantsForRole(role,C){
+  const isStrict=(role==='出金'||role==='入金'||role==='残高'||role==='日付');
+  if(!C.multiPass || !isStrict) return [];
+  // 罫線密着帳票向け。初回前処理と違う条件を試す。
+  return [
+    {bin:'adaptive'},
+    {bin:'otsu', lineRemove:false},
+    {bin:'adaptive', lineRemove:false},
+    {bin:'none', lineRemove:false, denoise:false}
+  ];
+}
+// 役割からOCRパラメータとスケジューラを決定し、最良候補を返す
+async function recognizeCellRole(baseCell, role, C){
+  const isAmt=(role==='出金'||role==='入金'||role==='残高');
+  const isDate=(role==='日付');
+  // 摘要・その他列はローカルAI(PaddleOCR)が使えるなら優先
+  if(!isAmt && !isDate && (role==='摘要'||role==='その他') && C.usePaddle && paddleReady()){
+    try{
+      const p=await paddleRecognize(baseCell.__raw||baseCell);   // 2値化前の原画像を渡す（AIモデルは自然画像で学習）
+      const res={text:(p.text||'').replace(/\s+/g,''), rawText:p.text, conf:p.conf, engine:'paddle', alts:[]};
+      if(res.text && res.conf>=C.confTh){
+        return res;                                              // 高信頼ならAI結果を採用
+      }
+      // 低信頼ならTesseractでも読んで良い方を採用
+      const t=await recognizeCellBest(baseCell, role, _sched, '6', '', C);
+      const best=betterOcrCandidate(res, t, role);
+      if(best===res && C.showThumbs && res.conf<C.confTh && res.text){
+        res.__thumb=makeThumbDataURL(baseCell.__raw||baseCell, 150);
+      }
+      return best;
+    }catch(e){ /* AI失敗時はTesseractへフォールバック */ }
+  }
+  let whitelist='', psm='6', sched=_sched;
+  if(isAmt){ whitelist='0123456789,.\u2212\u25b2\u25b3()-'; psm='7'; sched=_numSched; }
+  else if(isDate){ whitelist='0123456789/.\u5e74\u6708\u65e5\u5143\u4ee4\u548c\u5e73\u6210\u662dRHS- '; psm='7'; sched=_sched; } // 和暦字（元令和平成昭）を含むため日本語モデル
+  return await recognizeCellBest(baseCell, role, sched, psm, whitelist, C);
+}
+async function recognizeCellBest(baseCell, role, sched, psm, whitelist, C){
+  const candidates=[];
+  function remember(c){
+    if(!c) return c;
+    candidates.push(Object.assign({}, c));
+    return c;
+  }
+  async function runOne(canvas, psmValue, wl){
+    const r=await sched.addJob('recognize', canvas, {
+      tessedit_char_whitelist: (wl!==undefined?wl:whitelist),
+      tessedit_pageseg_mode: psmValue,
+      user_defined_dpi:C.dpi,
+      preserve_interword_spaces:'1'
+    });
+    const raw=(r.data.text||'').trim().replace(/\s+/g,'');
+    const normalized=C.normalize ? normalizeByRole(raw, role) : raw;
+    return remember({text:normalized, rawText:raw, conf:Math.round(r.data.confidence||0), psm:psmValue});
+  }
+
+  const isAmt=(role==='出金'||role==='入金'||role==='残高');
+  const isStrictRole=(isAmt||role==='日付');
+
+  let best=await runOne(baseCell, psm);
+  if(C.retry && best.conf < C.confTh){
+    const altPsm=(psm==='7')?'8':'7';
+    best=betterOcrCandidate(best, await runOne(baseCell, altPsm), role);
+  }
+
+  // 既に高信頼かつ数値として読めていれば追加処理を省く（速度確保・精度は不変）
+  const baseGood = best.conf>=90 && (!isAmt || amountParseable(best.text));
+  const needsMore = !baseGood && ( (C.multiPass && isStrictRole) || best.conf < C.confTh || (isAmt && !amountParseable(best.text)) );
+
+  if(needsMore && baseCell.__raw){
+    if(isAmt && C.normalize){
+      best=betterOcrCandidate(best, await runOne(baseCell, psm, ''), role);
+    }
+    for(const vcfg of ocrVariantsForRole(role,C)){
+      const v=makeVariant(baseCell.__raw, vcfg);
+      let cand=await runOne(v, psm);
+      if(C.retry && cand.conf < C.confTh){
+        const altPsm=(psm==='7')?'8':'7';
+        cand=betterOcrCandidate(cand, await runOne(v, altPsm), role);
+      }
+      cand.variant=JSON.stringify(vcfg);
+      best=betterOcrCandidate(best,cand,role);
+    }
+  }
+  best.alts=dedupeOcrCandidates(candidates, role).slice(0,10);
+  // 低信頼セルのみ、確認用サムネを小さなdataURL文字列で保持（canvas参照は残さない）。
+  // 大量ページ処理でフルサイズcanvasが蓄積してメモリが枯渇するのを防ぐ。
+  if(C.showThumbs && (best.conf < C.confTh) && best.text){
+    best.__thumb = makeThumbDataURL(baseCell.__raw || baseCell, 150);
+  }
+  return best;
+}
+function dedupeOcrCandidates(candidates, role){
+  const map=new Map();
+  for(const c of candidates){
+    const key=(c.text||'')+'|'+(c.rawText||'');
+    const old=map.get(key);
+    if(!old || c.conf>old.conf) map.set(key, c);
+  }
+  return [...map.values()].sort((a,b)=>b.conf-a.conf);
+}
+function amountCandidates(cell, role){
+  const out=[];
+  const add=(c)=>{
+    if(!c) return;
+    const text=(c.text||'').trim();
+    if((role==='出金'||role==='入金') && text===''){
+      out.push({text:'', n:0, conf:c.conf||0, source:'blank'});
+      return;
+    }
+    const n=toNum(text);
+    if(n!=null) out.push({text, rawText:c.rawText, n, conf:c.conf||0, source:c.variant||c.psm||'best'});
+  };
+  add(cell);
+  (cell&&cell.alts||[]).forEach(add);
+  // 出金/入金は「実は空欄（誤読ノイズ）」という仮説を常に低信頼候補として注入。
+  // これにより両建て誤読（片側がノイズ）を残高検算で自動修復できる。
+  if(role==='出金'||role==='入金'){
+    if(!out.some(c=>c.source==='blank')) out.push({text:'', n:0, conf:1, source:'blank-hyp'});
+  }
+  const seen=new Map();
+  for(const c of out){
+    const key=String(c.n)+'|'+(c.text==='' ? 'B':'V');
+    const old=seen.get(key);
+    if(!old || c.conf>old.conf) seen.set(key,c);
+  }
+  return [...seen.values()].sort((a,b)=>b.conf-a.conf).slice(0,8);
+}
+function applyBalanceCandidateRepair(rows, roles, confTh, prevInit){
+  const idxOut=roles.indexOf('出金'), idxIn=roles.indexOf('入金'), idxBal=roles.indexOf('残高');
+  if(idxBal<0) return {lastBal:prevInit??null, lastEstimated:false};
+  let prev=(prevInit!=null)?prevInit:null;
+  let lastEstimated=false;
+  for(const row of rows){
+    const maxIdx=Math.max(idxOut, idxIn, idxBal);
+    for(let i=0;i<=maxIdx;i++) ensureCell(row,i);
+    const balCell=row[idxBal];
+    const balNow=toNum(balCell&&balCell.text);
+    if(prev==null){ if(balNow!=null) prev=balNow; continue; }
+
+    const outC=idxOut>=0?amountCandidates(row[idxOut],'出金'):[{n:0,text:'',conf:100,source:'none'}];
+    const inC=idxIn>=0?amountCandidates(row[idxIn],'入金'):[{n:0,text:'',conf:100,source:'none'}];
+    const balC=amountCandidates(row[idxBal],'残高');
+
+    const curBal=toNum(row[idxBal].text);
+    const curOut=idxOut>=0?(toNum(row[idxOut].text)||0):0;
+    const curIn=idxIn>=0?(toNum(row[idxIn].text)||0):0;
+    // 既に現状の読みで検算が合うなら触らない
+    if(curBal!=null && prev+curIn-curOut===curBal){ prev=curBal; lastEstimated=false; continue; }
+
+    // 検算を満たす候補組をすべて列挙し、スコア（合計信頼度＋元の読みに近いほど加点）で最良を選ぶ
+    let best=null, bestScore=-1;
+    for(const o of outC){
+      for(const inn of inC){
+        // 出金・入金が両方とも非ゼロの組は実務上ほぼ無いので減点（除外はしない）
+        const bothFlow=(o.n||0)!==0 && (inn.n||0)!==0;
+        for(const b of balC){
+          if(prev+(inn.n||0)-(o.n||0)===b.n){
+            let score=(o.conf||0)+(inn.conf||0)+(b.conf||0);
+            if(bothFlow) score-=120;
+            // 現状の読みと一致する候補は加点（不要な書き換えを避ける）
+            if(idxOut>=0 && o.text===row[idxOut].text) score+=30;
+            if(idxIn>=0 && inn.text===row[idxIn].text) score+=30;
+            if(b.text===row[idxBal].text) score+=30;
+            if(score>bestScore){ bestScore=score; best={o,inn,b}; }
+          }
+        }
+      }
+    }
+
+    if(best){
+      // 信頼度は底上げしない（元のconfを保持）。書き換えたセルにrepairedフラグのみ立てる。
+      if(idxOut>=0 && best.o.text!==row[idxOut].text){
+        row[idxOut]=Object.assign({}, row[idxOut], {text:best.o.text, repaired:true, repairedFrom:row[idxOut].text});
+      }
+      if(idxIn>=0 && best.inn.text!==row[idxIn].text){
+        row[idxIn]=Object.assign({}, row[idxIn], {text:best.inn.text, repaired:true, repairedFrom:row[idxIn].text});
+      }
+      if(best.b.text!==row[idxBal].text){
+        row[idxBal]=Object.assign({}, row[idxBal], {text:best.b.text, repaired:true, repairedFrom:row[idxBal].text});
+      }
+      prev=best.b.n; lastEstimated=false;
+    } else if(curBal!=null) {
+      prev=curBal; lastEstimated=false;
+    }
+  }
+  return {lastBal:prev, lastEstimated};
+}
+
+/* =========================================================================
+   摘要辞書補正：登録語との曖昧一致でOCR誤読を補正
+   銀行明細の摘要は語彙が少なく同じ語が繰り返されるため、辞書方式が有効。
+   ========================================================================= */
+// 比較用正規化：NFKC（半角カナ→全角、全角英数→半角）＋空白除去＋長音統一
+function normForDict(s){
+  let t=(s||'');
+  try{ t=t.normalize('NFKC'); }catch(e){}
+  return t.replace(/\s+/g,'').replace(/[ー―−]/g,'ー');
+}
+// 上限capつきLevenshtein距離（capを超えたら早期打ち切り＝cap+1を返す）
+function levCapped(a,b,cap){
+  const al=a.length, bl=b.length;
+  if(Math.abs(al-bl)>cap) return cap+1;
+  let prev=new Array(bl+1), curr=new Array(bl+1);
+  for(let j=0;j<=bl;j++) prev[j]=j;
+  for(let i=1;i<=al;i++){
+    curr[0]=i; let rowMin=curr[0];
+    for(let j=1;j<=bl;j++){
+      const cost=(a[i-1]===b[j-1])?0:1;
+      curr[j]=Math.min(prev[j]+1, curr[j-1]+1, prev[j-1]+cost);
+      if(curr[j]<rowMin) rowMin=curr[j];
+    }
+    if(rowMin>cap) return cap+1;
+    const tmp=prev; prev=curr; curr=tmp;
+  }
+  return prev[bl];
+}
+function parseDescDict(){
+  const raw=($('descDict')&&$('descDict').value)||'';
+  const terms=[];
+  const seen=new Set();
+  raw.split(/\r?\n/).forEach(line=>{
+    const t=line.trim(); if(!t) return;
+    const n=normForDict(t);
+    if(!n || seen.has(n)) return;
+    seen.add(n); terms.push({raw:t, norm:n});
+  });
+  return terms;
+}
+// 摘要列に辞書補正を適用。補正したセル数を返す。
+// 採用条件: 編集距離が語長の30%以内 かつ 2位候補と差がある（誤吸着防止）。
+function applyDescDictionary(rows, roles){
+  const idx=roles.indexOf('摘要'); if(idx<0) return 0;
+  const dict=parseDescDict(); if(!dict.length) return 0;
+  let fixed=0;
+  for(const row of rows){
+    const cell=row[idx]; if(!cell || !cell.text || cell.userEdited) continue;
+    const norm=normForDict(cell.text);
+    if(norm.length<2) continue;
+    const cap=Math.max(1, Math.round(Math.max(norm.length,2)*0.4));
+    let best=null, bestD=cap+1, second=cap+1;
+    for(const t of dict){
+      const d=levCapped(norm, t.norm, cap);
+      if(d<bestD){ second=bestD; bestD=d; best=t; }
+      else if(d<second){ second=d; }
+    }
+    if(!best || bestD===0) continue;                       // 一致済みは触らない
+    const tol=Math.max(1, Math.round(norm.length*0.3));
+    if(bestD<=tol && bestD<second){
+      row[idx]=Object.assign({}, cell, {text:best.raw, dictFixed:true, repairedFrom:cell.text});
+      fixed++;
+    }
+  }
+  return fixed;
+}
+
+/* =========================================================================
+   検算：前残高 ± 取引 = 当残高
+   ========================================================================= */
+function toNum(s){
+  if(!s) return null;
+  const digits=s.replace(/[^\d]/g,'');
+  if(digits==='') return null;
+  let n=parseInt(digits,10);
+  // ▲ △ ( ) や先頭のマイナスは負の金額（赤字）とみなす
+  if(/[\u25b2\u25b3]/.test(s) || /\(/.test(s) || /^\s*[-\u2212]/.test(s)) n=-n;
+  return n;
+}
+function roleMap(){
+  const m={};
+  $('colMap').querySelectorAll('select').forEach(sel=>{ m[sel.value]=parseInt(sel.dataset.col); });
+  return m;
+}
+// 列index → 役割名（OCRのホワイトリスト切替に使用）
+function rolesByIndex(){
+  const arr=[];
+  $('colMap').querySelectorAll('select').forEach(sel=>{ arr[parseInt(sel.dataset.col)]=sel.value; });
+  return arr;
+}
+
+// 日付テキストを {y,m,d, key} に解析（和暦の元号略号 R/H/S にも対応）。妥当でなければnull。
+function parseDateCell(text){
+  if(!text) return null;
+  let t=normalizeDateText(text);
+  // 和暦先頭（R/H/S/令/平/昭）→ 西暦概算へ補正（年単独でも順序判定に使える）
+  const eraMap={R:2018,令:2018,H:1988,平:1988,S:1925,昭:1925};
+  let eraAdd=0;
+  const em=t.match(/^([RHS令平昭])/);
+  if(em){ eraAdd=eraMap[em[1]]||0; t=t.replace(/^[RHS令平昭元]+/,''); }
+  const parts=t.split('/').map(x=>x.replace(/\D/g,'')).filter(x=>x!=='');
+  if(parts.length<2) return null;
+  let y,m,d;
+  if(parts.length>=3){ y=+parts[0]; m=+parts[1]; d=+parts[2]; }
+  else { y=null; m=+parts[0]; d=+parts[1]; }
+  if(eraAdd && y!=null) y=eraAdd+y;
+  if(m<1||m>12||d<1||d>31) return null;
+  const key=(y!=null? y*10000:0)+m*100+d;
+  return {y,m,d,key};
+}
+function dateLooksValid(text){ return parseDateCell(text)!=null; }
+
+// 1行の検算判定（表示と再計算の両方から呼ぶ純ロジック）
+function evalRow(row, roles, confTh, prevBal, prevEstimated, prevDateKey){
+  const idxOut=roles['出金'], idxIn=roles['入金'], idxBal=roles['残高'], idxDate=roles['日付'];
+  const canCheck=(idxBal!=null);
+  const fmt=n=>Number(n).toLocaleString('en-US');
+  function readVal(idx, role){
+    if(idx==null) return {n:0, ok:true, present:false, blank:true, conf:100, text:''};
+    const cell=row[idx]||{text:'',conf:0};
+    const text=(cell.text||'').trim();
+    const isAmount=(role==='出金'||role==='入金'||role==='残高');
+    if(isAmount && text===''){
+      if(role==='出金'||role==='入金') return {n:0, ok:true, present:true, blank:true, conf:cell.conf||0, text};
+      return {n:null, ok:false, present:true, blank:true, conf:cell.conf||0, text};
+    }
+    const n=isAmount ? toNum(text) : null;
+    const ok=isAmount ? (n!=null && (cell.conf||0)>=confTh) : ((cell.conf||0)>=confTh);
+    return {n, ok, present:true, blank:false, conf:cell.conf||0, text};
+  }
+  const out=readVal(idxOut,'出金'), inn=readVal(idxIn,'入金'), bal=readVal(idxBal,'残高');
+  let verdict='—', vClass='', estOut=null, estIn=null, lowConf=false;
+  row.forEach((cell,c)=>{ if(cell && cell.text && (cell.conf||0)<confTh) lowConf=true; });
+
+  // 日付妥当性・単調性（取引明細は時系列のため、日付の逆行は誤読のサイン）
+  let dateWarn=null;
+  if(idxDate!=null){
+    const dtext=(row[idxDate]&&row[idxDate].text||'').trim();
+    if(dtext){
+      const pd=parseDateCell(dtext);
+      if(!pd) dateWarn='日付形式?';
+      else {
+        if(prevDateKey!=null && pd.key<prevDateKey) dateWarn='日付逆行?';
+        prevDateKey=pd.key;
+      }
+    }
+  }
+
+  if(canCheck){
+    const bothFlow=(out.n||0)!==0 && (inn.n||0)!==0;
+    if(prevBal==null){
+      if(bal.n!=null){ verdict=bal.ok?'起点':'起点(低信頼)'; if(!bal.ok){ lowConf=true; vClass='warn'; } prevBal=bal.n; prevEstimated=!bal.ok; }
+    } else if(bothFlow){
+      verdict='入出金両方あり'; vClass='bad'; if(bal.ok){ prevBal=bal.n; prevEstimated=false; }
+    } else if(out.ok && inn.ok && bal.ok){
+      const expect=prevBal+(inn.n||0)-(out.n||0);
+      if(expect===bal.n){ verdict=prevEstimated?'OK(前残高推定使用)':'OK'; vClass=prevEstimated?'warn':'ok'; }
+      else { verdict='不一致 差額 '+fmt(bal.n-expect); vClass='bad'; }
+      prevBal=bal.n; prevEstimated=false;
+    } else {
+      const unknown=[];
+      if(out.present && !out.ok) unknown.push('out');
+      if(inn.present && !inn.ok) unknown.push('in');
+      if(!bal.ok) unknown.push('bal');
+      if(unknown.length===1){
+        if(unknown[0]==='bal' && out.ok && inn.ok){
+          const est=prevBal+(inn.n||0)-(out.n||0); verdict='推定残高 '+fmt(est); vClass='warn'; prevBal=est; prevEstimated=true;
+        } else if(unknown[0]==='out' && inn.ok && bal.n!=null){
+          const est=prevBal+(inn.n||0)-bal.n;
+          if(est>=0){ verdict='推定出金 '+fmt(est); vClass='warn'; estOut=est; prevBal=bal.n; prevEstimated=!bal.ok; }
+          else { verdict='判定不可(出金推定が負)'; vClass='bad'; if(bal.ok){ prevBal=bal.n; prevEstimated=false; } }
+        } else if(unknown[0]==='in' && out.ok && bal.n!=null){
+          const est=bal.n-prevBal+(out.n||0);
+          if(est>=0){ verdict='推定入金 '+fmt(est); vClass='warn'; estIn=est; prevBal=bal.n; prevEstimated=!bal.ok; }
+          else { verdict='判定不可(入金推定が負)'; vClass='bad'; if(bal.ok){ prevBal=bal.n; prevEstimated=false; } }
+        } else { verdict='判定不可'; vClass='bad'; if(bal.ok){ prevBal=bal.n; prevEstimated=false; } }
+      } else { verdict='判定不可'; vClass='bad'; if(bal.ok){ prevBal=bal.n; prevEstimated=false; } }
+    }
+  }
+  if(dateWarn && vClass!=='bad'){ vClass=vClass||'warn'; verdict=(verdict==='—'?dateWarn:verdict+' / '+dateWarn); }
+  const flag=(vClass==='bad'||vClass==='warn'||lowConf);
+  return {verdict, vClass, estOut, estIn, lowConf, flag, prevBal, prevEstimated, prevDateKey};
+}
+
+function renderResults(rows){
+  const roles=roleMap();
+  const C=cfg(); const confTh=C.confTh;
+  const tbl=$('resultTable'); clearEl(tbl);
+  const colN=rows[0]?.length||0;
+  const headSel=[...$('colMap').querySelectorAll('select')].map(s=>s.value);
+  const hasPages=rows.some(r=>r.__page!=null);
+  const showThumbs=$('optShowThumbs')?$('optShowThumbs').checked:true;
+  const idxOut=roles['出金'], idxIn=roles['入金'], idxBal=roles['残高'];
+  const fmt=n=>Number(n).toLocaleString('en-US');
+
+  // ヘッダ
+  const thead=tbl.insertRow();
+  thead.appendChild(el('th',{text:'#'}));
+  if(hasPages) thead.appendChild(el('th',{text:'頁'}));
+  for(let c=0;c<colN;c++) thead.appendChild(el('th',{text:headSel[c]||('列'+(c+1))}));
+  thead.appendChild(el('th',{text:'検算 / 推定'}));
+
+  // 1行のTR要素を生成（再描画でも使えるよう関数化）
+  function buildRow(row, r, ev){
+    const tr=el('tr');
+    tr.appendChild(el('td',{text:String(r+1)}));
+    if(hasPages) tr.appendChild(el('td',{text: row.__page!=null?String(row.__page):'—'}));
+    const tds=[];
+    row.forEach((cell,c)=>{
+      cell=cell||{text:'',rawText:'',conf:0,error:true};
+      const td=el('td'); tr.appendChild(td); tds[c]=td;
+      const isAmt=[idxOut,idxIn,idxBal].includes(c);
+      if(isAmt) td.className='amt';
+      const low=(cell.conf<confTh && cell.text);
+      const txtSpan=el('span',{class:'celltext'}, cell.text?cell.text:'—');
+      txtSpan.title='クリックで修正';
+      txtSpan.addEventListener('click', ()=>startEdit(td, row, c, r));
+      td.appendChild(txtSpan);
+      td.appendChild(document.createTextNode(' '));
+      td.appendChild(el('span',{class:'conf'+(low?' low':'')}, String(cell.conf!=null?cell.conf:'')));
+      if(cell.error) td.appendChild(badge('bad','OCR失敗'));
+      if(cell.userEdited) td.appendChild(badge('info','手修正'));
+      else if(cell.repaired){
+        const b=badge('info','候補採用'); if(cell.repairedFrom) b.title='補正前: '+cell.repairedFrom; td.appendChild(b);
+      }
+      else if(cell.dictFixed){
+        const b=badge('info','辞書補正'); if(cell.repairedFrom) b.title='補正前: '+cell.repairedFrom; td.appendChild(b);
+      }
+      if(cell.engine==='paddle') td.appendChild(badge('ok','AI'));
+      if(cell.reOcr) td.appendChild(badge('info','再OCR'));
+      if(cell.rawText && cell.rawText!==cell.text) td.appendChild(el('span',{class:'ocrraw', text:'補正前: '+cell.rawText}));
+      if(showThumbs && low && typeof cell.__thumb==='string'){ const im=el('img',{class:'thumb'}); im.src=cell.__thumb; td.appendChild(im); }
+    });
+    if(ev.estOut!=null && idxOut!=null && tds[idxOut]) tds[idxOut].appendChild(badge('warn','推定 '+fmt(ev.estOut)));
+    if(ev.estIn!=null && idxIn!=null && tds[idxIn]) tds[idxIn].appendChild(badge('warn','推定 '+fmt(ev.estIn)));
+    const vtd=el('td'); tr.appendChild(vtd);
+    if(ev.vClass) vtd.appendChild(badge(ev.vClass, ev.verdict)); else vtd.textContent=ev.verdict;
+    if(ev.flag) tr.classList.add('flag');
+    return tr;
+  }
+
+  // 全行評価（純ロジック。残高連鎖を維持）
+  function evalAll(){
+    let pb=null, pe=false, pdk=null; const evs=[], an=[]; let fl=0;
+    rows.forEach((row,r)=>{
+      const ev=evalRow(row, roles, confTh, pb, pe, pdk);
+      pb=ev.prevBal; pe=ev.prevEstimated; pdk=ev.prevDateKey;
+      evs.push(ev); an.push({verdict:ev.verdict, className:ev.vClass, lowConf:ev.lowConf});
+      if(ev.flag) fl++;
+    });
+    return {evs, an, fl};
+  }
+
+  let evState=evalAll();
+  S.lastAnalysis=evState.an;
+  const trRefs=new Array(rows.length).fill(null);
+
+  // チャンク描画（数千行でもUIを固めない）。フィルタONなら要確認行のみ。
+  let renderToken=0;
+  function paintTable(){
+    const myToken=++renderToken;
+    // ヘッダ以外を一旦クリア
+    while(tbl.rows.length>1) tbl.deleteRow(1);
+    for(let i=0;i<trRefs.length;i++) trRefs[i]=null;
+    const flaggedOnly=$('optFlaggedOnly').checked;
+    const order=[];
+    for(let r=0;r<rows.length;r++){ if(!flaggedOnly || evState.evs[r].flag) order.push(r); }
+    let i=0;
+    const CHUNK=120;
+    function step(){
+      if(myToken!==renderToken) return; // 新しい描画要求が来たら中断
+      const frag=document.createDocumentFragment();
+      const end=Math.min(i+CHUNK, order.length);
+      for(; i<end; i++){
+        const r=order[i];
+        const tr=buildRow(rows[r], r, evState.evs[r]);
+        trRefs[r]=tr; frag.appendChild(tr);
+      }
+      tbl.appendChild(frag);
+      if(i<order.length) (window.requestAnimationFrame||setTimeout)(step);
+    }
+    step();
+    // 情報行
+    const info=$('resultInfo');
+    info.textContent='全'+rows.length+'行'+(hasPages?'（頁あり）':'')+' ／ 要確認 '+evState.fl+'行'
+      +(flaggedOnly?'（要確認のみ表示中）':'（全行表示中）')
+      +(order.length>2000?' ※表示が重い場合は「要確認の行だけ表示」を有効に':'');
+  }
+
+  function updateBadge(fl){
+    const b=$('resultBadge'); clearEl(b);
+    b.appendChild(fl===0 ? badge('ok','要確認 0 行') : badge('bad','要確認 '+fl+' 行'));
+  }
+
+  // セル編集（クリック→入力）。確定で全行再評価し、表示を更新。
+  function startEdit(td, row, c, r){
+    const cell=row[c]||{text:'',conf:0};
+    const input=el('input',{class:'celledit', type:'text'}); input.value=cell.text||'';
+    clearEl(td); td.appendChild(input); input.focus(); input.select();
+    let done=false;
+    const finish=(commit)=>{
+      if(done) return; done=true;
+      if(commit){
+        row[c]=Object.assign({}, cell, {text:input.value.trim(), userEdited:true, conf:100, __thumb:undefined});
+      }
+      evState=evalAll(); S.lastAnalysis=evState.an; updateBadge(evState.fl); paintTable();
+      if(commit) log('セル修正を反映し再検算しました（要確認 '+evState.fl+'行）。');
+    };
+    input.addEventListener('keydown', e=>{ if(e.key==='Enter'){ finish(true); } else if(e.key==='Escape'){ finish(false); } });
+    input.addEventListener('blur', ()=>finish(true));
+  }
+
+  // 大量行は既定で要確認のみ表示（DOM軽量化）
+  if(rows.length>200 && !$('optFlaggedOnly').checked){ $('optFlaggedOnly').checked=true; }
+  $('optFlaggedOnly').onchange=paintTable;
+
+  updateBadge(evState.fl);
+  paintTable();
+  $('resultArea').style.display='block';
+  log('結果表示: 全'+rows.length+'行中 要確認 '+evState.fl+'行');
+}
+
+/* =========================================================================
+   Excel貼り付け用：タブ区切りでクリップボードへコピー（CSVファイルは作りません）
+   ========================================================================= */
+$('exportBtn').addEventListener('click', async ()=>{
+  if(!S.lastRows) return;
+  const headSel=[...$('colMap').querySelectorAll('select')].map(s=>s.value);
+  const hasPages=S.lastRows.some(r=>r.__page!=null);
+  const clean = s => (s||'').replace(/[\t\r\n]/g,' ').trim(); // セル内のタブ/改行を除去
+  const header=['行', ...(hasPages?['頁']:[]), ...headSel, '検算/推定'];
+  const lines=[header.join('\t')];
+  S.lastRows.forEach((row,r)=> {
+    const verdict=(S.lastAnalysis&&S.lastAnalysis[r])?S.lastAnalysis[r].verdict:'';
+    const cols=[(r+1), ...(hasPages?[row.__page!=null?row.__page:'']:[]), ...row.map(c=>clean((c||{}).text)), clean(verdict)];
+    lines.push(cols.join('\t'));
+  });
+  const tsv=lines.join('\n');
+
+  // 自動コピーを試行。失敗時は欄を全選択して手動コピーできるようにする
+  const ta=$('tsvOut'); ta.value=tsv; ta.style.display='block'; ta.focus(); ta.select();
+  try{
+    await navigator.clipboard.writeText(tsv);
+    log('クリップボードにコピーしました。Excelのセルで貼り付け（Ctrl+V）してください。');
+  }catch(e){
+    log('自動コピー不可。下の欄が全選択済みです。Ctrl+C でコピーしてExcelに貼り付けてください。');
+  }
+});
+</script>
+</body>
+</html>

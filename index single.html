@@ -4016,7 +4016,7 @@ function getHardPrintIssues(intent){
   const stat=getTplAdjustmentSummary(t);
   if(validCount<=0) issues.push('印刷対象がありません');
   if(printIntent !== 'test' && mismatch.length>0) issues.push(`キューにテンプレート不一致が${mismatch.length}件あります`);
-  if(!getCurrentPrinter()) issues.push('プリンタが選択されていません');
+  if(!getCurrentPrinter()) issues.push('プリンタの補正プロファイルが未選択です（テスト印刷画面の「②ズレ補正」で追加・選択）');
   if(printIntent !== 'test' && (!stat || !stat.testPrinted)) issues.push('テスト印刷結果が未確認、またはレイアウト変更後に再確認されていません');
   return issues;
 }
@@ -6519,6 +6519,119 @@ function renderStep4(){
 }
 
 /* ===== v38-12 extracted from 10_core.js: renderPrinterProfileSection ===== */
+/* v41-10 致命バグ修正: renderPrinterCalibForm / bindPrinterCalibForm が過去の
+   リファクタで定義ごと消失し、呼び出しだけが残っていた。このため renderStep4 が
+   毎回 ReferenceError で途中終了し、(1)プロファイル選択UIが描画されない
+   (2)後続の updateStep4Summary / テスト確認チェック同期が一切走らない
+   （＝「設定しているのに認識されない」）状態だった。ここで再実装する。
+   注: ブラウザはOSのプリンタ一覧を取得できないため、実機の選択は印刷ダイアログで
+   行う。ここで言う「プリンタ」は機種ごとの印字ズレ補正プロファイルを指す。 */
+function renderPrinterCalibForm(t){
+  const profiles=state.printerProfiles||[];
+  const p=getCurrentPrinter();
+  const c=p?getPrinterCorrection(p.id,t.id):{rightShift:0,downShift:0,widthDiff:0,heightDiff:0};
+  const options=profiles.map(pr=>
+    `<option value="${escapeHtml(pr.id)}"${pr.id===state.selectedPrinterId?' selected':''}>${escapeHtml(pr.name)}</option>`
+  ).join('');
+  const corrRow=(label,k,v,hint)=>`
+    <div>
+      <label style="font-size:11px">${label}</label>
+      <input type="number" step="0.1" data-corr-k="${k}" value="${Number(v)||0}" style="width:100%;padding:6px;font-size:12px">
+      <div class="hint" style="margin-top:2px">${hint}</div>
+    </div>`;
+  return `
+    <div class="hint" style="margin-bottom:8px">実際に使うプリンタ（機種）は、印刷実行時にブラウザの印刷ダイアログで選びます。ここでは<strong>機種ごとの印字ズレ補正値</strong>に名前を付けて保存します（例: 職場のLBP / 自宅のTS8530）。</div>
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+      <select id="printerSelect" style="flex:1;min-width:150px;padding:6px;font-size:12px">
+        ${profiles.length&&!p?'<option value="" selected>（プロファイルを選択してください）</option>':''}
+        ${options||'<option value="">（補正プロファイル未登録）</option>'}
+      </select>
+      <button class="btn sm" id="btnPrinterAdd" type="button">＋追加</button>
+      ${p?'<button class="btn ghost sm" id="btnPrinterRename" type="button">名前変更</button><button class="btn ghost sm" id="btnPrinterDelete" type="button">削除</button>':''}
+    </div>
+    ${p?`
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      ${corrRow('右ズレ (mm)','rightShift',c.rightShift,'印字が右に2mmズレた→2を入力')}
+      ${corrRow('下ズレ (mm)','downShift',c.downShift,'印字が下に1.5mmズレた→1.5を入力')}
+      ${corrRow('横幅差 (mm)','widthDiff',c.widthDiff,'印字幅が紙より2mm広い→2を入力')}
+      ${corrRow('縦幅差 (mm)','heightDiff',c.heightDiff,'印字高が紙より1mm広い→1を入力')}
+    </div>
+    <div class="hint" style="margin-top:6px">テスト印刷を実封筒に重ね、ズレを定規で測ってそのまま入力してください。マイナス値も可（左・上ズレ）。補正値はこのプロファイル×現在のテンプレートの組み合わせで保存されます。</div>
+    `:`<div class="hint">「＋追加」でプロファイルを作ると、ズレ補正値を保存できます。補正不要のプリンタでも、本印刷前チェックを通すために登録だけしておくことを推奨します。</div>`}
+  `;
+}
+
+function bindPrinterCalibForm(t){
+  const sec=$('printerProfileSection');
+  if(!sec) return;
+  const sel=$('printerSelect');
+  if(sel){
+    sel.addEventListener('change',()=>{
+      state.selectedPrinterId=sel.value||null;
+      save();
+      renderPrinterProfileSection();
+      updateStep4Summary();
+    });
+  }
+  const bindClick=global.safeBindClick||((el,h)=>el&&el.addEventListener('click',h));
+  bindClick($('btnPrinterAdd'),async()=>{
+    const name=await showAppPrompt('プリンタ名を入力（例: Canon TS8530 背面トレイ）','','補正プロファイルの追加');
+    if(!name||!String(name).trim()) return false;
+    const prof={id:uid('printer'),name:String(name).trim(),perTpl:{}};
+    state.printerProfiles.push(prof);
+    state.selectedPrinterId=prof.id;
+    save();
+    renderPrinterProfileSection();
+    updateStep4Summary();
+    toast(`プロファイル「${prof.name}」を追加しました`,'ok');
+    return true;
+  },'btnPrinterAdd');
+  bindClick($('btnPrinterRename'),async()=>{
+    const p=getCurrentPrinter();if(!p) return false;
+    const name=await showAppPrompt('新しい名前','' + p.name,'プロファイル名の変更');
+    if(!name||!String(name).trim()) return false;
+    p.name=String(name).trim();
+    save();
+    renderPrinterProfileSection();
+    updateStep4Summary();
+    return true;
+  },'btnPrinterRename');
+  bindClick($('btnPrinterDelete'),async()=>{
+    const p=getCurrentPrinter();if(!p) return false;
+    const ok=await showAppConfirm(`プロファイル「${p.name}」を削除しますか？\n保存済みの補正値（全テンプレート分）も削除されます。`,'プロファイルの削除',{okLabel:'削除する',danger:true});
+    if(!ok) return false;
+    state.printerProfiles=state.printerProfiles.filter(x=>x.id!==p.id);
+    state.selectedPrinterId=state.printerProfiles.length?state.printerProfiles[0].id:null;
+    save();
+    renderPrinterProfileSection();
+    updateStep4Summary();
+    toast('プロファイルを削除しました','ok');
+    return true;
+  },'btnPrinterDelete');
+  sec.querySelectorAll('input[data-corr-k]').forEach(inp=>{
+    inp.addEventListener('change',()=>{
+      const p=getCurrentPrinter();if(!p) return;
+      const read=k=>{
+        const el=sec.querySelector(`input[data-corr-k="${k}"]`);
+        const v=el?parseFloat(el.value):0;
+        return isFinite(v)?Math.round(v*10)/10:0;
+      };
+      const corr={rightShift:read('rightShift'),downShift:read('downShift'),widthDiff:read('widthDiff'),heightDiff:read('heightDiff')};
+      setPrinterCorrection(p.id,t.id,corr);
+      // 補正値の変更後は再テスト印刷が必要（既存のレイアウト変更検知と同じ扱い）。
+      if(typeof markLayoutChanged==='function') markLayoutChanged(t);
+      save();
+      updateStep4Summary();
+      if(typeof renderSteps==='function') renderSteps();
+      const stat=getTplAdjustmentSummary(t);
+      const banner=$('layoutChangedBanner');
+      if(banner) banner.style.display=(t.adjustmentStatus&&t.adjustmentStatus.lastLayoutChangedAt&&!stat.testPrinted)?'block':'none';
+      const chk=$('markTestPrinted');
+      if(chk) chk.checked=!!stat.testPrinted;
+    });
+  });
+}
+
 function renderPrinterProfileSection(){
   const sec=$('printerProfileSection');
   const t=getCurrentTpl();if(!t) return;
@@ -6530,7 +6643,7 @@ function renderPrinterProfileSection(){
 function updateStep4Summary(){
   const t=getCurrentTpl();
   const p=getCurrentPrinter();
-  $('sumPrinter').textContent=p?p.name:'（未選択）';
+  $('sumPrinter').textContent=p?p.name:'（未登録・②で追加）';
   if(t&&p){
     const c=getPrinterCorrection(p.id,t.id);
     $('sumRightShift').textContent=c.rightShift+' mm';
@@ -9338,32 +9451,31 @@ body{background:#fff;overflow:visible}
           <h4>⚠ レイアウト変更後のため、テスト印刷の再実施が必要です</h4>
           <div>前回テスト印刷後に印字位置や設定が変更されています。本印刷前にもう一度テスト印刷してください。</div>
         </div>
-        <div id="a4CalibrationPatternSection"></div>
-        <div id="a4CalibrationScanSection"></div>
-        <div id="a4CalibrationApplyPreviewSection"></div>
-        <div id="a4CalibrationTestLogSection"></div>
+        <div class="info-banner" style="margin-bottom:14px">
+          <h4>テスト印刷の手順</h4>
+          <div style="font-size:12px">① 試し刷り → ② 実封筒に重ねてズレをmmで測る → ③ ズレ補正に入力 → ④ もう一度試し刷りして「結果を確認しました」にチェック</div>
+        </div>
         <div class="step4-layout">
           <div>
             <div style="background:#fff;border:1px solid var(--line-soft);padding:18px;margin-bottom:14px">
-              <h4 class="serif" style="font-size:14px;margin-bottom:10px">テスト印刷</h4>
-              <p style="font-size:12px;color:#666;margin-bottom:12px">用紙またはコピー用紙で試し刷りし、実封筒に重ねて位置を確認します</p>
+              <h4 class="serif" style="font-size:14px;margin-bottom:10px">① テスト印刷</h4>
+              <p style="font-size:12px;color:#666;margin-bottom:12px">コピー用紙などで試し刷りし、実封筒に重ねて位置を確認します。実際のプリンタは印刷ダイアログで選択します。</p>
               <div style="display:flex;gap:8px;flex-wrap:wrap">
                 <button class="btn" id="btnTestSample">サンプル宛先で1枚</button>
                 <button class="btn" id="btnTestFirst">キュー1件目で</button>
                 <button class="btn" id="btnTestWorst" title="文字あふれ・縮小が最も大きい宛先を自動で選んでテスト印刷します">最長・あふれ宛先で</button>
                 <button class="btn ghost" id="btnTestCross">十字マーク・罫線</button>
-                <button class="btn warn" id="btnTestSampleA4Calibration">A4補正ありサンプル</button>
-                <button class="btn warn" id="btnTestCrossA4Calibration">A4補正あり十字</button>
               </div>
               <div class="hint" style="margin-top:8px">印刷後、実封筒に重ねて位置のズレを定規で測ってください</div>
-              <div style="margin-top:14px;padding:10px;background:var(--paper-2);border:1px solid var(--line-soft)">
-                <label class="checkbox-row"><input type="checkbox" id="markTestPrinted"><span>テスト印刷の結果を確認しました（位置OK）</span></label>
-                <div class="hint" style="margin-top:4px">これにチェックを入れると、実印刷成功ではなく「テスト印刷結果をユーザが確認した」記録として扱います</div>
-              </div>
+            </div>
+            <div style="background:#fff;border:1px solid var(--line-soft);padding:18px;margin-bottom:14px">
+              <h4 class="serif" style="font-size:14px;margin-bottom:10px">② プリンタごとのズレ補正（見たまま入力）</h4>
+              <div id="printerProfileSection"></div>
             </div>
             <div style="background:#fff;border:1px solid var(--line-soft);padding:18px">
-              <h4 class="serif" style="font-size:14px;margin-bottom:10px">プリンタ補正（見たまま入力）</h4>
-              <div id="printerProfileSection"></div>
+              <h4 class="serif" style="font-size:14px;margin-bottom:10px">③ 結果の確認</h4>
+              <label class="checkbox-row"><input type="checkbox" id="markTestPrinted"><span>テスト印刷の結果を確認しました（位置OK）</span></label>
+              <div class="hint" style="margin-top:4px">チェックすると本印刷に進めます。位置や補正値を変更すると再確認が必要になります</div>
             </div>
           </div>
           <div class="print-summary">
@@ -9371,7 +9483,7 @@ body{background:#fff;overflow:visible}
             <div class="summary-row"><span class="lbl">テンプレート</span><span class="val" id="sumTpl4">—</span></div>
             <div class="summary-row"><span class="lbl">封筒サイズ</span><span class="val" id="sumSize4">—</span></div>
             <div class="summary-row"><span class="lbl">予定枚数</span><span class="val" id="sumCount4">0</span></div>
-            <div class="summary-row"><span class="lbl">プリンタ</span><span class="val" id="sumPrinter">—</span></div>
+            <div class="summary-row"><span class="lbl">補正プロファイル</span><span class="val" id="sumPrinter">—</span></div>
             <div class="summary-row"><span class="lbl">右ズレ</span><span class="val" id="sumRightShift">0 mm</span></div>
             <div class="summary-row"><span class="lbl">下ズレ</span><span class="val" id="sumDownShift">0 mm</span></div>
             <div class="summary-row"><span class="lbl">横幅差</span><span class="val" id="sumWidthDiff">0 mm</span></div>
@@ -9379,6 +9491,20 @@ body{background:#fff;overflow:visible}
             <div class="summary-row"><span class="lbl">テスト状態</span><span class="val" id="sumTestStatus">未テスト</span></div>
           </div>
         </div>
+        <details id="a4CalibrationDetails" style="margin-top:14px;background:#fff;border:1px solid var(--line-soft)">
+          <summary style="padding:12px 18px;cursor:pointer;font-size:13px;font-weight:600">詳細キャリブレーション（A4共通補正・上級者向け）</summary>
+          <div style="padding:0 18px 18px">
+            <div class="hint" style="margin-bottom:10px">A4パターン印刷でプリンタ固有の誤差を機械的に測定する高度な機能です。通常は上の「ズレ補正」で十分です。</div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+              <button class="btn warn sm" id="btnTestSampleA4Calibration">A4補正ありサンプル</button>
+              <button class="btn warn sm" id="btnTestCrossA4Calibration">A4補正あり十字</button>
+            </div>
+            <div id="a4CalibrationPatternSection"></div>
+            <div id="a4CalibrationScanSection"></div>
+            <div id="a4CalibrationApplyPreviewSection"></div>
+            <div id="a4CalibrationTestLogSection"></div>
+          </div>
+        </details>
       </div>
     </div>
 
